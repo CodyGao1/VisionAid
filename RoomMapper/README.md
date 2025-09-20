@@ -1,35 +1,34 @@
-# RoomMapper (ARKit + RealityKit)
+# RoomMapper (ARKit + RealityKit + WebSocket streaming)
 
-An iOS SwiftUI app that uses ARKit scene reconstruction to map a room and visualize mesh with debug overlays.
+## iOS App
+- Streams AR mesh anchors over WebSocket as JSON
+- UI to configure server URL and start/stop streaming
 
-## Requirements
-- Xcode 15 or newer
-- iOS 17 device with LiDAR (e.g., iPhone 12 Pro or newer) for mesh reconstruction
-- Developer account to sign and run on device
+### Run
+1. Open in Xcode, set Signing Team, select device, Run.
+2. Ensure the Python server is reachable on the same network.
 
-## Setup
-1. Generate the Xcode project (already done):
+## Python Server
+Located in `RoomStreamServer/`.
 
+### Setup
 ```bash
-cd RoomMapper
-xcodegen generate
+cd RoomStreamServer
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python server.py
 ```
+- Server listens at `ws://0.0.0.0:8765` and visualizes the merged mesh (Open3D).
 
-2. Open the project:
-
-```bash
-open RoomMapper.xcodeproj
+### Data format (JSON text frame)
+```json
+{
+  "type": "mesh-anchor",
+  "anchorId": "UUID",
+  "transform": [16 floats],
+  "vertices": [x,y,z,...],
+  "normals": [x,y,z,...],
+  "indices": [i0,i1,i2,...]
+}
 ```
-
-3. In Xcode:
-- Select the `RoomMapper` target.
-- Set your Team in Signing & Capabilities.
-- Ensure a physical device with LiDAR is selected.
-
-4. Run on device. Grant camera access when prompted.
-
-## Notes
-- Mesh visualization is enabled via `ARView.DebugOptions.showSceneUnderstanding`.
-- The app enables horizontal/vertical plane detection, scene reconstruction, and uses `sceneDepth` if supported.
-
-MD
