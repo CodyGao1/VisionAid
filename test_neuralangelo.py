@@ -14,7 +14,7 @@ import glob
 
 # Configuration (override via env: API_BASE, IMAGE_PATH, EXPORT_FORMAT, ITERATIONS, TIMEOUT, MAX_IMAGES)
 API_BASE = os.getenv("API_BASE", "http://35.202.229.212:8081")
-IMAGE_PATH = os.getenv("IMAGE_PATH", "/Users/devnarang/Desktop/Projects/KellerAI/mainimage.jpg")
+IMAGE_PATH = os.getenv("IMAGE_PATH", "mainimage.jpg")
 EXPORT_FORMAT = os.getenv("EXPORT_FORMAT", "ply")  # ply | obj | stl
 ITERATIONS = int(os.getenv("ITERATIONS", "500"))
 TIMEOUT = int(os.getenv("TIMEOUT", "300"))
