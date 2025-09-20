@@ -22,17 +22,17 @@
 	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
-	<key>NSCameraUsageDescription</key>
-	<string>We need camera access to map your room using AR.</string>
-	<key>NSLocalNetworkUsageDescription</key>
-	<string>This app discovers and connects to a local WebSocket server to stream mesh.</string>
-	<key>NSBonjourServices</key>
-	<array/>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsArbitraryLoads</key>
 		<true/>
 	</dict>
+	<key>NSBonjourServices</key>
+	<array/>
+	<key>NSCameraUsageDescription</key>
+	<string>We need camera access to map your room using AR.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>This app discovers and connects to a local WebSocket server to stream mesh.</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>
