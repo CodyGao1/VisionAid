@@ -119,6 +119,8 @@ export class WebSocketClient extends EventEmitter<WebSocketClientEventTypes> {
   }
 
   private handleMessage(message: any) {
+    console.log("WebSocket received message:", message);
+    
     if (message.setupComplete) {
       this.log("server.send", "setupComplete");
       this.emit("setupcomplete");
@@ -139,6 +141,7 @@ export class WebSocketClient extends EventEmitter<WebSocketClientEventTypes> {
 
     if (message.serverContent) {
       const { serverContent } = message;
+      console.log("Processing serverContent:", serverContent);
       
       if ("interrupted" in serverContent) {
         this.log("server.content", "interrupted");
@@ -153,6 +156,7 @@ export class WebSocketClient extends EventEmitter<WebSocketClientEventTypes> {
 
       if ("modelTurn" in serverContent) {
         const content = { modelTurn: serverContent.modelTurn };
+        console.log("Emitting content:", content);
         this.emit("content", content);
         this.log("server.content", message);
       }

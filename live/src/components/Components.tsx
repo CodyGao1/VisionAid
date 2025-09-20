@@ -781,17 +781,44 @@ export function SidePanel() {
   // listen for log events and store them
   useEffect(() => {
     client.on("log", log);
+    
+    // Also listen for content events to ensure they're being received
+    const onContent = (content: any) => {
+      console.log("SidePanel received content event:", content);
+      
+      // Extract the text from the response and display it nicely
+      if (content.modelTurn && content.modelTurn.parts && content.modelTurn.parts.length > 0) {
+        const text = content.modelTurn.parts[0].text;
+        if (text) {
+          // Log as a clean message that will display nicely in the UI
+          log({
+            date: new Date(),
+            type: "receive.content",
+            message: {
+              serverContent: content
+            }
+          });
+        }
+      }
+    };
+    
+    client.on("content", onContent);
+    
     return () => {
       client.off("log", log);
+      client.off("content", onContent);
     };
   }, [client, log]);
 
   const handleSubmit = () => {
-    client.send([{ text: textInput }]);
+    if (textInput.trim()) {
+      console.log("Sending text message:", textInput);
+      client.send([{ text: textInput }]);
 
-    setTextInput("");
-    if (inputRef.current) {
-      inputRef.current.innerText = "";
+      setTextInput("");
+      if (inputRef.current) {
+        inputRef.current.value = "";
+      }
     }
   };
 
@@ -981,7 +1008,7 @@ function ControlTray({
   const [webcam, screenCapture] = videoStreams;
   const [inVolume, setInVolume] = useState(0);
   const [audioRecorder] = useState(() => new AudioRecorder());
-  const [muted, setMuted] = useState(false);
+  const [muted, setMuted] = useState(true); // Default to muted to prevent audio flooding
   const renderCanvasRef = useRef<HTMLCanvasElement>(null);
   const connectButtonRef = useRef<HTMLButtonElement>(null);
 
@@ -1013,10 +1040,13 @@ function ControlTray({
     // Check if current mode requires audio input (voice-to-text or voice-to-voice)
     const isTextToTextMode = config.modality === "text-to-text";
     
-    // Only start audio recorder if NOT in text-to-text mode
+    // Only start audio recorder if NOT in text-to-text mode AND not muted
+    // Default to muted for text-only mode
     if (connected && !muted && audioRecorder && !isTextToTextMode) {
+      console.log("Starting audio recorder");
       audioRecorder.on("data", onData).on("volume", setInVolume).start();
     } else {
+      console.log("Stopping audio recorder - textMode:", isTextToTextMode, "muted:", muted);
       audioRecorder.stop();
     }
     return () => {
