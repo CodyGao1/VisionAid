@@ -35,9 +35,12 @@ export function useLiveAPI(options: LiveClientOptions): UseLiveAPIResults {
   const client = useMemo(() => new GenAILiveClient(options), [options]);
   const audioStreamerRef = useRef<AudioStreamer | null>(null);
 
-  const [model, setModel] = useState<string>("models/gemini-2.0-flash-exp");
+  // Use native audio Live API model
+  const [model, setModel] = useState<string>("gemini-2.5-flash-preview-native-audio-dialog");
   const [config, setConfig] = useState<LiveConnectConfig>({
-    systemInstruction: DEFAULT_SYSTEM_INSTRUCTIONS
+    systemInstruction: DEFAULT_SYSTEM_INSTRUCTIONS,
+    modality: "voice-to-voice",  // Default to voice-to-voice
+    voiceName: "Puck"           // Default voice
   });
   const [connected, setConnected] = useState(false);
   const [volume, setVolume] = useState(0);
@@ -52,7 +55,10 @@ export function useLiveAPI(options: LiveClientOptions): UseLiveAPIResults {
             setVolume(ev.data.volume);
           })
           .then(() => {
-            // Successfully added worklet
+            console.log("Audio worklet added successfully");
+          })
+          .catch((error) => {
+            console.error("Error adding audio worklet:", error);
           });
       });
     }
@@ -60,28 +66,42 @@ export function useLiveAPI(options: LiveClientOptions): UseLiveAPIResults {
 
   useEffect(() => {
     const onOpen = () => {
+      console.log("Live API connection opened");
       setConnected(true);
     };
 
     const onClose = () => {
+      console.log("Live API connection closed");
       setConnected(false);
     };
 
     const onError = (error: ErrorEvent) => {
-      console.error("error", error);
+      console.error("Live API error", error);
     };
 
-    const stopAudioStreamer = () => audioStreamerRef.current?.stop();
+    const stopAudioStreamer = () => {
+      console.log("Stopping audio streamer due to interruption");
+      audioStreamerRef.current?.stop();
+    };
 
-    const onAudio = (data: ArrayBuffer) =>
-      audioStreamerRef.current?.addPCM16(new Uint8Array(data));
+    const onAudio = (data: ArrayBuffer) => {
+      console.log("Received audio data:", data.byteLength, "bytes");
+      if (audioStreamerRef.current) {
+        audioStreamerRef.current.addPCM16(new Uint8Array(data));
+      }
+    };
+
+    const onSetupComplete = () => {
+      console.log("Live API setup complete");
+    };
 
     client
       .on("error", onError)
       .on("open", onOpen)
       .on("close", onClose)
       .on("interrupted", stopAudioStreamer)
-      .on("audio", onAudio);
+      .on("audio", onAudio)
+      .on("setupcomplete", onSetupComplete);
 
     return () => {
       client
@@ -90,6 +110,7 @@ export function useLiveAPI(options: LiveClientOptions): UseLiveAPIResults {
         .off("close", onClose)
         .off("interrupted", stopAudioStreamer)
         .off("audio", onAudio)
+        .off("setupcomplete", onSetupComplete)
         .disconnect();
     };
   }, [client]);
@@ -98,12 +119,20 @@ export function useLiveAPI(options: LiveClientOptions): UseLiveAPIResults {
     if (!config) {
       throw new Error("config has not been set");
     }
+    console.log("Connecting to Live API with config:", config);
     client.disconnect();
-    await client.connect(model, config);
+    const success = await client.connect(model, config);
+    if (!success) {
+      throw new Error("Failed to connect to Live API");
+    }
   }, [client, config, model]);
 
   const disconnect = useCallback(async () => {
+    console.log("Disconnecting from Live API");
     client.disconnect();
+    if (audioStreamerRef.current) {
+      audioStreamerRef.current.stop();
+    }
     setConnected(false);
   }, [setConnected, client]);
 

@@ -20,6 +20,8 @@ export interface LiveConnectConfig {
   systemInstruction?: string;
   generationConfig?: any;
   tools?: any[];
+  modality?: "text-to-text" | "voice-to-text" | "voice-to-voice";
+  voiceName?: string;
 }
 
 export class WebSocketClient extends EventEmitter<WebSocketClientEventTypes> {
@@ -69,10 +71,10 @@ export class WebSocketClient extends EventEmitter<WebSocketClientEventTypes> {
         
         this.ws.onopen = () => {
           this._status = "connected";
-          this.log("client.open", "Connected");
+          this.log("client.open", "Connected to Live API");
           this.emit("open");
           
-          // Send setup message
+          // Send setup message with Live API configuration
           if (this.ws && this.model && this.config) {
             const setupMessage = {
               setup: {
@@ -80,6 +82,7 @@ export class WebSocketClient extends EventEmitter<WebSocketClientEventTypes> {
                 config: this.config
               }
             };
+            console.log("Sending setup message:", setupMessage);
             this.ws.send(JSON.stringify(setupMessage));
           }
           resolve(true);
@@ -89,14 +92,14 @@ export class WebSocketClient extends EventEmitter<WebSocketClientEventTypes> {
           this._status = "disconnected";
           this.log("server.close", `disconnected ${event.reason ? `with reason: ${event.reason}` : ``}`);
           this.emit("close", event);
-          this.ws = null; // Clear the reference
+          this.ws = null;
         };
 
         this.ws.onerror = (event) => {
           this._status = "disconnected";
           this.log("server.error", "WebSocket error");
           this.emit("error", event as ErrorEvent);
-          this.ws = null; // Clear the reference
+          this.ws = null;
           reject(event);
         };
 
@@ -143,22 +146,45 @@ export class WebSocketClient extends EventEmitter<WebSocketClientEventTypes> {
       const { serverContent } = message;
       console.log("Processing serverContent:", serverContent);
       
+      // Handle interruptions
       if ("interrupted" in serverContent) {
         this.log("server.content", "interrupted");
         this.emit("interrupted");
         return;
       }
       
-      if ("turnComplete" in serverContent) {
+      // Handle turn completion
+      if ("turnComplete" in serverContent && serverContent.turnComplete) {
         this.log("server.content", "turnComplete");
         this.emit("turncomplete");
       }
 
+      // Handle text responses
       if ("modelTurn" in serverContent) {
         const content = { modelTurn: serverContent.modelTurn };
-        console.log("Emitting content:", content);
+        console.log("Emitting text content:", content);
         this.emit("content", content);
         this.log("server.content", message);
+      }
+
+      // Handle audio responses from Live API
+      if ("audio" in serverContent) {
+        console.log("Received audio data");
+        const audioData = serverContent.audio;
+        if (audioData.data) {
+          try {
+            // Convert base64 to ArrayBuffer for audio playback
+            const binaryString = atob(audioData.data);
+            const bytes = new Uint8Array(binaryString.length);
+            for (let i = 0; i < binaryString.length; i++) {
+              bytes[i] = binaryString.charCodeAt(i);
+            }
+            this.emit("audio", bytes.buffer);
+            this.log("server.audio", `buffer (${bytes.length})`);
+          } catch (e) {
+            console.error("Error processing audio data:", e);
+          }
+        }
       }
     }
 

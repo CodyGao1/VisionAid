@@ -224,6 +224,9 @@ const voiceOptions = [
   { value: "Kore", label: "Kore" },
   { value: "Fenrir", label: "Fenrir" },
   { value: "Aoede", label: "Aoede" },
+  { value: "Leda", label: "Leda" },
+  { value: "Orus", label: "Orus" },
+  { value: "Zephyr", label: "Zephyr" },
 ];
 
 const modalityOptions = [
@@ -240,7 +243,7 @@ export function SettingsDialog() {
   const [selectedVoice, setSelectedVoice] = useState<{
     value: string;
     label: string;
-  } | null>(voiceOptions[4]); // Default to Aoede
+  } | null>(voiceOptions[0]); // Default to Puck
   
   // Modality selector state
   const [selectedModality, setSelectedModality] = useState<{
@@ -287,7 +290,7 @@ export function SettingsDialog() {
 
   // Update voice selector when config changes
   useEffect(() => {
-    const voiceName = "Aoede"; // Default voice for WebSocket implementation
+    const voiceName = config.voiceName || "Puck"; // Default voice for Live API
     const voiceOption = { value: voiceName, label: voiceName };
     setSelectedVoice(voiceOption);
   }, [config]);
@@ -313,16 +316,16 @@ export function SettingsDialog() {
   // Modality update function
   const updateModalityConfig = useCallback(
     (modality: "text-to-text" | "voice-to-text" | "voice-to-voice") => {
-      // For WebSocket implementation, just update the modality in config
+      // Update the modality and voice in config for Live API
       const newConfig: LiveConnectConfig = {
         ...config,
         modality: modality,
-        voiceName: selectedVoice?.value || "Aoede",
+        voiceName: selectedVoice?.value || "Puck",
       };
       
       setConfig(newConfig);
     },
-    [config, setConfig, selectedVoice, setModel]
+    [config, setConfig, selectedVoice]
   );
 
   const updateConfig: FormEventHandler<HTMLTextAreaElement> = useCallback(
