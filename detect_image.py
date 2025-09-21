@@ -49,8 +49,8 @@ def plot_bounding_boxes(image_path: str, bounding_boxes: List[BoundingBox]) -> N
                         normalized [y_min, x_min, y_max, x_max] format.
     """
     try:
-        # Open local image file with context manager
-        with Image.open(image_path) as im:
+        # Open local image file
+        im = Image.open(image_path)
         
         width, height = im.size
         draw = ImageDraw.Draw(im)
