@@ -1,53 +1,31 @@
 #!/usr/bin/env python3
 """
-Bounding Box Detection Script using Gemini 2.5 Flash Lite
-Prompts user for image path and detection targets, then displays bounding boxes.
+Bounding Box Detection Script - Client for KellerAI VM Backend
+Sends image to VM server for detection using Gemini API, then displays bounding boxes.
 """
 
 import json
-import os
-import sys
+import base64
+import requests
 from pathlib import Path
-from google import genai
-from google.genai.types import (
-    GenerateContentConfig,
-    HarmBlockThreshold,
-    HarmCategory,
-    Part,
-    SafetySetting,
-)
 from PIL import Image, ImageColor, ImageDraw
 from pydantic import BaseModel
 from typing import List
+import sys
 
 
 class BoundingBox(BaseModel):
-    """
-    Represents a bounding box with its 2D coordinates and associated label.
-
-    Attributes:
-        box_2d (list[int]): A list of integers representing the 2D coordinates of the bounding box,
-                            typically in the format [y_min, x_min, y_max, x_max].
-        label (str): A string representing the label or class associated with the object within the bounding box.
-    """
     box_2d: List[int]
     label: str
 
 
-# Hardcoded API key and image path
-GEMINI_API_KEY = "AIzaSyAEY_B2spe-XeNAIr8t2mbxH8dlx1ETa4A"
+# Configuration for VM server
+VM_SERVER_URL = "http://35.238.205.88:8081"  # KellerAI VM server
+DETECT_ENDPOINT = f"{VM_SERVER_URL}/detect"
 IMAGE_PATH = "/Users/devnarang/Desktop/Projects/KellerAI/mainimage.jpg"
 
 
 def plot_bounding_boxes(image_path: str, bounding_boxes: List[BoundingBox]) -> None:
-    """
-    Plots bounding boxes on an image with labels, using PIL and normalized coordinates.
-
-    Args:
-        image_path: The path to the local image file.
-        bounding_boxes: A list of BoundingBox objects. Each box's coordinates are in
-                        normalized [y_min, x_min, y_max, x_max] format.
-    """
     try:
         # Open local image file
         im = Image.open(image_path)
@@ -85,14 +63,30 @@ def plot_bounding_boxes(image_path: str, bounding_boxes: List[BoundingBox]) -> N
 
 def get_user_input():
     """Get detection target from user."""
-    print("🔍 Bounding Box Detection with Gemini 2.5 Flash Lite")
+    print("🔍 KellerAI Object Detection - VM Backend Client")
     print("=" * 50)
+    print(f"🖥️  VM Server: {VM_SERVER_URL}")
     print(f"📁 Using image: {IMAGE_PATH}")
     
     # Check if the hardcoded image exists
     if not Path(IMAGE_PATH).exists():
         print(f"❌ Image not found: {IMAGE_PATH}")
         sys.exit(1)
+    
+    # Test server connectivity
+    try:
+        print(f"\n🔗 Testing connection to VM server...")
+        response = requests.get(f"{VM_SERVER_URL}/", timeout=5)
+        if response.status_code == 200:
+            print("✅ VM server is online and ready")
+        else:
+            print(f"⚠️  VM server responded with status {response.status_code}")
+    except requests.exceptions.ConnectionError:
+        print(f"❌ Cannot connect to VM server at {VM_SERVER_URL}")
+        print("Make sure the server is running and the URL is correct.")
+        sys.exit(1)
+    except Exception as e:
+        print(f"⚠️  Error testing server connection: {e}")
     
     # Get detection target
     detection_target = input("\n🎯 What would you like to detect in the image? (e.g., 'all people', 'red cars', 'animals'): ").strip()
@@ -103,88 +97,67 @@ def get_user_input():
 
 
 def detect_objects(image_path: str, detection_target: str):
-    """Detect objects in the image using Gemini."""
+    """Send image to VM server for object detection."""
     try:
         print(f"\n🤖 Analyzing image for: {detection_target}")
-        print("⏳ Processing with Gemini 2.5 Flash Lite...")
+        print("⏳ Sending to KellerAI VM server...")
         
-        # Initialize client with API key
-        client = genai.Client(api_key=GEMINI_API_KEY)
-        
-        # Configure the model
-        config = GenerateContentConfig(
-            system_instruction=f"""
-            Return bounding boxes as a JSON array with labels for {detection_target}.
-            Never return masks. Limit to 25 objects.
-            If an object is present multiple times, give each object a unique label
-            according to its distinct characteristics (colors, size, position, etc.).
-            Be precise and descriptive in your labels.
-            
-            Format the response as JSON like this:
-            [
-                {{"box_2d": [y_min, x_min, y_max, x_max], "label": "description"}},
-                {{"box_2d": [y_min, x_min, y_max, x_max], "label": "description"}}
-            ]
-            """,
-            temperature=0.3,
-            safety_settings=[
-                SafetySetting(
-                    category=HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
-                    threshold=HarmBlockThreshold.BLOCK_ONLY_HIGH,
-                ),
-            ],
-        )
-        
-        # Prepare content parts for local file
+        # Encode image to base64
         with open(image_path, 'rb') as f:
             image_data = f.read()
+            image_base64 = base64.b64encode(image_data).decode('utf-8')
         
-        content_parts = [
-            Part.from_bytes(data=image_data, mime_type="image/jpeg"),
-            f"Find and return bounding boxes for {detection_target} in this image. Label each detection clearly."
-        ]
+        # Prepare request payload
+        payload = {
+            "image_base64": image_base64,
+            "detection_target": detection_target
+        }
         
-        # Generate content
-        response = client.models.generate_content(
-            model="gemini-2.5-flash-lite",
-            contents=content_parts,
-            config=config,
+        # Send request to VM server
+        response = requests.post(
+            DETECT_ENDPOINT,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=60  # 60 second timeout for processing
         )
         
-        if response.text:
-            try:
-                # Try to parse the JSON response
-                response_text = response.text.strip()
-                if response_text.startswith('```json'):
-                    response_text = response_text.split('```json')[1].split('```')[0].strip()
-                elif response_text.startswith('```'):
-                    response_text = response_text.split('```')[1].split('```')[0].strip()
-                
-                bbox_data = json.loads(response_text)
-                
+        if response.status_code == 200:
+            result = response.json()
+            
+            if result["success"]:
                 # Convert to BoundingBox objects
-                bounding_boxes = [BoundingBox(box_2d=item['box_2d'], label=item['label']) for item in bbox_data]
+                bounding_boxes = [BoundingBox(box_2d=item['box_2d'], label=item['label']) for item in result["detections"]]
                 
                 print(f"✅ Found {len(bounding_boxes)} objects")
                 
                 # Print detected objects
-                print("\n📋 Detected objects:")
-                for i, bbox in enumerate(bounding_boxes, 1):
-                    print(f"   {i}. {bbox.label}")
-                
-                # Plot bounding boxes
-                plot_bounding_boxes(image_path, bounding_boxes)
+                if bounding_boxes:
+                    print("\n📋 Detected objects:")
+                    for i, bbox in enumerate(bounding_boxes, 1):
+                        print(f"   {i}. {bbox.label}")
+                    
+                    # Plot bounding boxes
+                    plot_bounding_boxes(image_path, bounding_boxes)
+                else:
+                    print("📋 No objects detected matching your criteria")
                 
                 return bounding_boxes
-                
-            except (json.JSONDecodeError, KeyError) as e:
-                print(f"❌ Error parsing response: {e}")
-                print(f"Raw response: {response.text}")
+            else:
+                print(f"❌ Detection failed: {result.get('error', 'Unknown error')}")
                 return []
         else:
-            print("❌ No response received")
+            print(f"❌ Server error: {response.status_code}")
+            if response.text:
+                print(f"Error details: {response.text}")
             return []
             
+    except requests.exceptions.Timeout:
+        print("❌ Request timed out. VM server may be overloaded or image too large.")
+        return []
+    except requests.exceptions.ConnectionError:
+        print(f"❌ Could not connect to VM server at {VM_SERVER_URL}")
+        print("Make sure the server is running and accessible.")
+        return []
     except Exception as e:
         print(f"❌ Error during detection: {e}")
         return []
