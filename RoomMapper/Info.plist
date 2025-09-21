@@ -33,6 +33,10 @@
 	<string>We need camera access to map your room using AR.</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>This app discovers and connects to a local WebSocket server to stream mesh.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>We need microphone access for voice commands to find objects in your room.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>We need speech recognition to understand your voice commands for finding objects.</string>
 	<key>NSMotionUsageDescription</key>
 	<string></string>
 	<key>UIApplicationSceneManifest</key>
@@ -46,8 +50,6 @@
 				<dict>
 					<key>UISceneConfigurationName</key>
 					<string>Default Configuration</string>
-					<key>UISceneDelegateClassName</key>
-					<string></string>
 					<key>UIStoryboardName</key>
 					<string></string>
 				</dict>
