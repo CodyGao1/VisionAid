@@ -1,24 +1,64 @@
+/*
+ * ESP32-CAM WebSocket Video Broadcaster
+ * 
+ * Battery-powered ESP32-CAM that streams video via WebSocket
+ * 
+ * Required Libraries (install via Arduino Library Manager):
+ * - WebSocketsClient by Markus Sattler
+ * - ArduinoJson by Benoit Blanchon  
+ * - Base64 by Densaugeo
+ * 
+ * Usage:
+ * 1. Upload this code to ESP32-CAM
+ * 2. Power via battery (3.7V Li-Po recommended)
+ * 3. Camera will connect to WiFi and stream to WebSocket server
+ * 4. Remove DEBUG_MODE line for production (saves battery)
+ */
+
+// Uncomment for debugging (remove for battery operation)
+#define DEBUG_MODE
+
 #include "esp_camera.h"
 #include <WiFi.h>
+#include <WebSocketsClient.h>
+#include <ArduinoJson.h>
+#include <base64.h>
+
 
 // ===========================
 // Select camera model in board_config.h
 // ===========================
 #include "board_config.h"
 
+
 // ===========================
-// Enter your WiFi credentials
+// WiFi and WebSocket Configuration
 // ===========================
 const char *ssid = "Dev iPhone 13 Pro";
 const char *password = "historyis";
 
-void startCameraServer();
+// WebSocket server details
+const char* websocket_host = "35.238.205.88";
+const int websocket_port = 8081;
+const char* websocket_path = "/video?role=broadcaster";
+
+WebSocketsClient webSocket;
+bool wsConnected = false;
+
 void setupLedFlash();
+void webSocketEvent(WStype_t type, uint8_t * payload, size_t length);
+void sendVideoFrame();
+void connectWebSocket();
+
 
 void setup() {
+  // Optional Serial for debugging (remove for battery operation)
+  #ifdef DEBUG_MODE
   Serial.begin(115200);
   Serial.setDebugOutput(true);
   Serial.println();
+  #endif
+
 
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
@@ -48,6 +88,7 @@ void setup() {
   config.jpeg_quality = 12;
   config.fb_count = 1;
 
+
   // if PSRAM IC present, init with UXGA resolution and higher JPEG quality
   //                      for larger pre-allocated frame buffer.
   if (config.pixel_format == PIXFORMAT_JPEG) {
@@ -68,17 +109,22 @@ void setup() {
 #endif
   }
 
+
 #if defined(CAMERA_MODEL_ESP_EYE)
   pinMode(13, INPUT_PULLUP);
   pinMode(14, INPUT_PULLUP);
 #endif
 
+
   // camera init
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
+    #ifdef DEBUG_MODE
     Serial.printf("Camera init failed with error 0x%x", err);
+    #endif
     return;
   }
+
 
   sensor_t *s = esp_camera_sensor_get();
   // initial sensors are flipped vertically and colors are a bit saturated
@@ -92,39 +138,129 @@ void setup() {
     s->set_framesize(s, FRAMESIZE_QVGA);
   }
 
+
 #if defined(CAMERA_MODEL_M5STACK_WIDE) || defined(CAMERA_MODEL_M5STACK_ESP32CAM)
   s->set_vflip(s, 1);
   s->set_hmirror(s, 1);
 #endif
 
+
 #if defined(CAMERA_MODEL_ESP32S3_EYE)
   s->set_vflip(s, 1);
 #endif
+
 
 // Setup LED FLash if LED pin is defined in camera_pins.h
 #if defined(LED_GPIO_NUM)
   setupLedFlash();
 #endif
 
+
   WiFi.begin(ssid, password);
   WiFi.setSleep(false);
 
+  #ifdef DEBUG_MODE
   Serial.print("WiFi connecting");
+  #endif
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
+    #ifdef DEBUG_MODE
     Serial.print(".");
+    #endif
   }
+  #ifdef DEBUG_MODE
   Serial.println("");
   Serial.println("WiFi connected");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+  #endif
 
-  startCameraServer();
 
-  Serial.print("Camera Ready! Use 'http://");
-  Serial.print(WiFi.localIP());
-  Serial.println("' to connect");
+  // Setup WebSocket connection
+  connectWebSocket();
+
+  #ifdef DEBUG_MODE
+  Serial.println("Camera Ready! Streaming to WebSocket server...");
+  #endif
 }
+
 
 void loop() {
-  // Do nothing. Everything is done in another task by the web server
-  delay(10000);
+  webSocket.loop();
+  
+  if (wsConnected) {
+    sendVideoFrame();
+    delay(100); // Adjust frame rate (100ms = ~10 FPS)
+  } else {
+    // Try to reconnect if disconnected
+    delay(5000);
+    connectWebSocket();
+  }
 }
+
+// WebSocket event handler
+void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
+  switch(type) {
+    case WStype_DISCONNECTED:
+      #ifdef DEBUG_MODE
+      Serial.println("[WS] Disconnected");
+      #endif
+      wsConnected = false;
+      break;
+      
+    case WStype_CONNECTED:
+      #ifdef DEBUG_MODE
+      Serial.printf("[WS] Connected to: %s\n", payload);
+      #endif
+      wsConnected = true;
+      break;
+      
+    case WStype_TEXT:
+      #ifdef DEBUG_MODE
+      Serial.printf("[WS] Received: %s\n", payload);
+      #endif
+      // Handle server messages here if needed
+      break;
+      
+    case WStype_ERROR:
+      #ifdef DEBUG_MODE
+      Serial.println("[WS] Error occurred");
+      #endif
+      wsConnected = false;
+      break;
+      
+    default:
+      break;
+  }
+}
+
+// Connect to WebSocket server
+void connectWebSocket() {
+  #ifdef DEBUG_MODE
+  Serial.println("[WS] Connecting to WebSocket server...");
+  #endif
+  webSocket.begin(websocket_host, websocket_port, websocket_path);
+  webSocket.onEvent(webSocketEvent);
+  webSocket.setReconnectInterval(5000);
+  webSocket.enableHeartbeat(15000, 3000, 2);
+}
+
+// Capture and send video frame
+void sendVideoFrame() {
+  camera_fb_t * fb = esp_camera_fb_get();
+  if (!fb) {
+    #ifdef DEBUG_MODE
+    Serial.println("Camera capture failed");
+    #endif
+    return;
+  }
+  
+  // Encode frame to base64
+  String encoded = base64::encode(fb->buf, fb->len);
+  
+  // Send directly to WebSocket (simplified for the VM server)
+  webSocket.sendTXT(encoded);
+  
+  esp_camera_fb_return(fb);
+}
+
