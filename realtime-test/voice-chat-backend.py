@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-KellerAI Realtime Voice Chat - Backend Client
-Connects to your secure backend server for voice chat with OpenAI.
+OpenAI Realtime Voice Chat - Backend Client
+Connects to your secure backend server instead of directly to OpenAI.
 """
 
 import asyncio
@@ -16,8 +16,9 @@ from typing import Optional
 import queue
 import time
 
-# Configuration - Now connects to your backend server
-BACKEND_SERVER_URL = "ws://35.238.205.88:8081/realtime"
+# Configuration - Update this with your VM's external IP
+BACKEND_SERVER_URL = "ws://YOUR_VM_EXTERNAL_IP:8081/realtime"
+# Example: "ws://34.123.45.67:8081/realtime"
 
 # Audio settings
 CHUNK_SIZE = 1024
@@ -27,7 +28,8 @@ SAMPLE_RATE = 24000  # OpenAI uses 24kHz
 BYTES_PER_SAMPLE = 2
 
 class VoiceChatClient:
-    def __init__(self):
+    def __init__(self, backend_url: str):
+        self.backend_url = backend_url
         self.audio = pyaudio.PyAudio()
         self.websocket: Optional[websockets.WebSocketClientProtocol] = None
         self.is_recording = False
@@ -44,7 +46,7 @@ class VoiceChatClient:
         print("   - Press ENTER to start/stop recording")
         print("   - Type 'q' and press ENTER to quit")
         print("   - The AI will respond with voice automatically")
-        print(f"   - Backend server: {BACKEND_SERVER_URL}\n")
+        print(f"   - Backend server: {backend_url}\n")
 
     def setup_audio(self):
         """Initialize audio input and output streams."""
@@ -87,7 +89,7 @@ class VoiceChatClient:
         """Connect to KellerAI backend server."""
         try:
             print("🔌 Connecting to KellerAI backend server...")
-            self.websocket = await websockets.connect(BACKEND_SERVER_URL)
+            self.websocket = await websockets.connect(self.backend_url)
             print("✅ Connected to KellerAI backend server")
             
             # Setup audio after successful connection
@@ -294,11 +296,17 @@ def signal_handler(signum, frame):
 
 async def main():
     """Main function."""
+    # Check if backend URL is configured
+    if "YOUR_VM_EXTERNAL_IP" in BACKEND_SERVER_URL:
+        print("❌ Please update BACKEND_SERVER_URL with your VM's external IP address")
+        print("   Example: ws://34.123.45.67:8081/realtime")
+        sys.exit(1)
+    
     # Set up signal handler
     signal.signal(signal.SIGINT, signal_handler)
     
     # Create and run voice chat client
-    voice_chat = VoiceChatClient()
+    voice_chat = VoiceChatClient(BACKEND_SERVER_URL)
     
     try:
         await voice_chat.connect_to_backend()
