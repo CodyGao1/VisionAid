@@ -1152,6 +1152,17 @@ class SpeechManager: ObservableObject {
 	@Published var isListening = false
 	@Published var recognizedText = ""
 	
+	// Continuous transcription properties
+	@Published var isContinuousMode = false
+	@Published var isTranscribing = false
+	@Published var fullTranscript = ""
+	@Published var currentSegment = ""
+	@Published var isShowingTranscript = false
+	
+	private var transcriptSegments: [String] = []
+	private var lastTranscriptUpdate = Date()
+	private let segmentTimeout: TimeInterval = 3.0 // Seconds of silence before starting new segment
+	
 	init() {
 		requestPermissions()
 	}
@@ -1259,15 +1270,181 @@ class SpeechManager: ObservableObject {
 		recognitionTask = nil
 		recognitionRequest = nil
 		
-		// Restore audio session for spatial audio playback
+		// Restore audio session for spatial audio playback (only if not in continuous mode)
+		if !isContinuousMode || !isTranscribing {
+			do {
+				let audioSession = AVAudioSession.sharedInstance()
+				try audioSession.setCategory(.playback, mode: .default, options: [.allowBluetooth, .allowBluetoothA2DP, .allowAirPlay])
+				try audioSession.setActive(true)
+				print("✅ Audio session restored for spatial audio")
+			} catch {
+				print("Failed to restore audio session for spatial audio: \(error)")
+			}
+		}
+	}
+	
+	// MARK: - Continuous Transcription Methods
+	
+	func toggleContinuousMode() {
+		if isContinuousMode {
+			stopContinuousTranscription()
+		} else {
+			startContinuousTranscription()
+		}
+	}
+	
+	func startContinuousTranscription() {
+		guard !isTranscribing else { return }
+		
+		isContinuousMode = true
+		isTranscribing = true
+		
+		print("🎤 Starting continuous transcription...")
+		startContinuousListening()
+	}
+	
+	func stopContinuousTranscription() {
+		isContinuousMode = false
+		isTranscribing = false
+		
+		// Finalize current segment
+		finalizeCurrentSegment()
+		
+		// Stop any ongoing recognition
+		stopListening()
+		
+		print("🎤 Stopped continuous transcription")
+	}
+	
+	func clearTranscript() {
+		fullTranscript = ""
+		currentSegment = ""
+		transcriptSegments.removeAll()
+		lastTranscriptUpdate = Date()
+	}
+	
+	func saveTranscript() -> String {
+		let timestamp = DateFormatter()
+		timestamp.dateFormat = "yyyy-MM-dd HH:mm:ss"
+		let header = "Transcript - \(timestamp.string(from: Date()))\n\n"
+		return header + fullTranscript
+	}
+	
+	private func startContinuousListening() {
+		// Configure audio session for continuous speech recognition
 		do {
 			let audioSession = AVAudioSession.sharedInstance()
-			try audioSession.setCategory(.playback, mode: .default, options: [.allowBluetooth, .allowBluetoothA2DP, .allowAirPlay])
-			try audioSession.setActive(true)
-			print("✅ Audio session restored for spatial audio")
+			try audioSession.setCategory(.playAndRecord, mode: .measurement, options: [.defaultToSpeaker, .allowBluetooth])
+			try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
 		} catch {
-			print("Failed to restore audio session for spatial audio: \(error)")
+			print("Failed to configure audio session for continuous transcription: \(error)")
+			return
 		}
+		
+		// Cancel any previous task
+		recognitionTask?.cancel()
+		recognitionTask = nil
+		
+		// Reset audio engine
+		if speechAudioEngine.isRunning {
+			speechAudioEngine.stop()
+			speechAudioEngine.inputNode.removeTap(onBus: 0)
+		}
+		
+		// Create recognition request
+		recognitionRequest = SFSpeechAudioBufferRecognitionRequest()
+		guard let recognitionRequest = recognitionRequest else { return }
+		recognitionRequest.shouldReportPartialResults = true
+		
+		// Configure audio engine
+		let inputNode = speechAudioEngine.inputNode
+		let recordingFormat = inputNode.outputFormat(forBus: 0)
+		
+		let desiredFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32,
+										  sampleRate: recordingFormat.sampleRate,
+										  channels: 1,
+										  interleaved: false)
+		
+		guard let format = desiredFormat else {
+			print("Failed to create audio format for continuous transcription")
+			return
+		}
+		
+		inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { buffer, _ in
+			recognitionRequest.append(buffer)
+		}
+		
+		speechAudioEngine.prepare()
+		do {
+			try speechAudioEngine.start()
+		} catch {
+			print("Speech audio engine couldn't start for continuous transcription: \(error)")
+			inputNode.removeTap(onBus: 0)
+			return
+		}
+		
+		// Start recognition with continuous handling
+		recognitionTask = speechRecognizer?.recognitionTask(with: recognitionRequest) { [weak self] result, error in
+			DispatchQueue.main.async {
+				self?.handleContinuousRecognitionResult(result: result, error: error)
+			}
+		}
+	}
+	
+	private func handleContinuousRecognitionResult(result: SFSpeechRecognitionResult?, error: Error?) {
+		guard isContinuousMode && isTranscribing else { return }
+		
+		if let result = result {
+			let newText = result.bestTranscription.formattedString
+			currentSegment = newText
+			lastTranscriptUpdate = Date()
+			
+			// If this is a final result, add it to the transcript and start a new segment
+			if result.isFinal {
+				finalizeCurrentSegment()
+				// Restart recognition for next segment
+				DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+					if self?.isContinuousMode == true && self?.isTranscribing == true {
+						self?.restartContinuousRecognition()
+					}
+				}
+			}
+		}
+		
+		if let error = error {
+			print("Continuous recognition error: \(error)")
+			// Restart recognition after error
+			DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+				if self?.isContinuousMode == true && self?.isTranscribing == true {
+					self?.restartContinuousRecognition()
+				}
+			}
+		}
+	}
+	
+	private func finalizeCurrentSegment() {
+		guard !currentSegment.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+		
+		let timestamp = DateFormatter()
+		timestamp.dateFormat = "HH:mm:ss"
+		let timestampedSegment = "[\(timestamp.string(from: Date()))] \(currentSegment.trimmingCharacters(in: .whitespacesAndNewlines))"
+		
+		transcriptSegments.append(timestampedSegment)
+		fullTranscript = transcriptSegments.joined(separator: "\n\n")
+		currentSegment = ""
+		
+		print("📝 Added segment to transcript: \(timestampedSegment)")
+	}
+	
+	private func restartContinuousRecognition() {
+		// Clean up current recognition
+		recognitionRequest?.endAudio()
+		recognitionTask?.cancel()
+		recognitionTask = nil
+		recognitionRequest = nil
+		
+		// Start new recognition session
+		startContinuousListening()
 	}
 }
 
@@ -1308,27 +1485,55 @@ struct ContentView: View {
 					Spacer()
 				}
 				
-				// Target active indicator
-				if spatialAudioManager.isPlayingPing {
-					VStack {
-						HStack {
-							Spacer()
-							HStack(spacing: 8) {
-								Image(systemName: "speaker.wave.2.fill")
-									.font(.system(size: 14))
-								Text("Target Active")
-									.font(.system(size: 14, weight: .medium))
+				// Status indicators at top
+				VStack {
+					VStack(spacing: 8) {
+						// Target active indicator
+						if spatialAudioManager.isPlayingPing {
+							HStack {
+								Spacer()
+								HStack(spacing: 8) {
+									Image(systemName: "speaker.wave.2.fill")
+										.font(.system(size: 14))
+									Text("Target Active")
+										.font(.system(size: 14, weight: .medium))
+								}
+								.foregroundColor(.white)
+								.padding(.horizontal, 12)
+								.padding(.vertical, 6)
+								.background(Color.green.opacity(0.8))
+								.cornerRadius(15)
+								Spacer()
 							}
-							.foregroundColor(.white)
-							.padding(.horizontal, 12)
-							.padding(.vertical, 6)
-							.background(Color.green.opacity(0.8))
-							.cornerRadius(15)
-							Spacer()
 						}
-						.padding(.top, 20)
-						Spacer()
+						
+						// Transcription active indicator
+						if speechManager.isTranscribing {
+							HStack {
+								Spacer()
+								HStack(spacing: 8) {
+									Circle()
+										.fill(Color.red)
+										.frame(width: 8, height: 8)
+										.scaleEffect(speechManager.isTranscribing ? 1.2 : 1.0)
+										.animation(.easeInOut(duration: 0.6).repeatForever(autoreverses: true), value: speechManager.isTranscribing)
+									
+									Image(systemName: "waveform")
+										.font(.system(size: 14))
+									Text("Recording Transcript")
+										.font(.system(size: 14, weight: .medium))
+								}
+								.foregroundColor(.white)
+								.padding(.horizontal, 12)
+								.padding(.vertical, 6)
+								.background(Color.red.opacity(0.8))
+								.cornerRadius(15)
+								Spacer()
+							}
+						}
 					}
+					.padding(.top, 20)
+					Spacer()
 				}
 				
 				// Target position indicator (green circle with music note)
@@ -1513,6 +1718,45 @@ struct ContentView: View {
 										.padding(.vertical, 12)
 										.background(Color.blue.opacity(0.8))
 										.cornerRadius(25)
+								}
+							}
+						}
+						
+						// Continuous transcription controls
+						HStack(spacing: 15) {
+							// Continuous transcription toggle
+							Button(action: {
+								speechManager.toggleContinuousMode()
+							}) {
+								HStack(spacing: 8) {
+									Image(systemName: speechManager.isTranscribing ? "waveform.circle.fill" : "waveform.circle")
+										.font(.system(size: 16))
+									Text(speechManager.isTranscribing ? "Stop Transcript" : "Start Transcript")
+										.font(.system(size: 16, weight: .medium))
+								}
+								.foregroundColor(.white)
+								.padding(.horizontal, 20)
+								.padding(.vertical, 12)
+								.background(speechManager.isTranscribing ? Color.red.opacity(0.8) : Color.teal.opacity(0.8))
+								.cornerRadius(25)
+							}
+							
+							// View transcript button (only show if there's a transcript)
+							if !speechManager.fullTranscript.isEmpty || speechManager.isTranscribing {
+								Button(action: {
+									speechManager.isShowingTranscript.toggle()
+								}) {
+									HStack(spacing: 8) {
+										Image(systemName: "doc.text")
+											.font(.system(size: 16))
+										Text("View")
+											.font(.system(size: 16, weight: .medium))
+									}
+									.foregroundColor(.white)
+									.padding(.horizontal, 20)
+									.padding(.vertical, 12)
+									.background(Color.indigo.opacity(0.8))
+									.cornerRadius(25)
 								}
 							}
 						}
@@ -1724,6 +1968,165 @@ struct ContentView: View {
 					.background(Color.black.opacity(0.8))
 					.cornerRadius(15)
 					.frame(maxWidth: 300)
+				}
+				
+				// Transcript viewer overlay
+				if speechManager.isShowingTranscript {
+					Color.black.opacity(0.4)
+						.ignoresSafeArea()
+						.onTapGesture {
+							speechManager.isShowingTranscript = false
+						}
+					
+					VStack(spacing: 15) {
+						// Header with status
+						HStack {
+							VStack(alignment: .leading) {
+								Text("🎤 Live Transcript")
+									.font(.title2)
+									.fontWeight(.bold)
+									.foregroundColor(.white)
+								
+								if speechManager.isTranscribing {
+									HStack(spacing: 8) {
+										Circle()
+											.fill(Color.red)
+											.frame(width: 10, height: 10)
+											.scaleEffect(speechManager.isTranscribing ? 1.2 : 1.0)
+											.animation(.easeInOut(duration: 0.6).repeatForever(autoreverses: true), value: speechManager.isTranscribing)
+										
+										Text("Recording...")
+											.font(.caption)
+											.foregroundColor(.red)
+									}
+								} else {
+									Text("Recording stopped")
+										.font(.caption)
+										.foregroundColor(.gray)
+								}
+							}
+							
+							Spacer()
+							
+							// Close button
+							Button(action: {
+								speechManager.isShowingTranscript = false
+							}) {
+								Image(systemName: "xmark.circle.fill")
+									.font(.title2)
+									.foregroundColor(.gray)
+							}
+						}
+						
+						// Current segment (if actively transcribing)
+						if speechManager.isTranscribing && !speechManager.currentSegment.isEmpty {
+							VStack(alignment: .leading, spacing: 8) {
+								Text("Current:")
+									.font(.caption)
+									.foregroundColor(.yellow)
+								
+								Text(speechManager.currentSegment)
+									.font(.body)
+									.foregroundColor(.yellow)
+									.padding()
+									.background(Color.gray.opacity(0.3))
+									.cornerRadius(8)
+									.opacity(0.8)
+							}
+							.frame(maxWidth: .infinity, alignment: .leading)
+						}
+						
+						// Full transcript
+						ScrollView {
+							ScrollViewReader { proxy in
+								VStack(alignment: .leading, spacing: 12) {
+									if speechManager.fullTranscript.isEmpty && !speechManager.isTranscribing {
+										Text("No transcript available. Start transcription to see content here.")
+											.font(.body)
+											.foregroundColor(.gray)
+											.multilineTextAlignment(.center)
+											.padding()
+									} else {
+										Text(speechManager.fullTranscript.isEmpty ? "Listening... Start speaking to see your words here." : speechManager.fullTranscript)
+											.font(.body)
+											.foregroundColor(.white)
+											.textSelection(.enabled)
+											.frame(maxWidth: .infinity, alignment: .leading)
+											.id("transcript")
+											.onChange(of: speechManager.fullTranscript) { _ in
+												// Auto-scroll to bottom when new content is added
+												withAnimation(.easeOut(duration: 0.3)) {
+													proxy.scrollTo("transcript", anchor: .bottom)
+												}
+											}
+									}
+								}
+								.padding()
+							}
+						}
+						.frame(maxHeight: 400)
+						.background(Color.black.opacity(0.6))
+						.cornerRadius(10)
+						
+						// Action buttons
+						HStack(spacing: 15) {
+							// Clear transcript
+							Button(action: {
+								speechManager.clearTranscript()
+							}) {
+								HStack(spacing: 8) {
+									Image(systemName: "trash")
+									Text("Clear")
+								}
+								.foregroundColor(.white)
+								.padding(.horizontal, 16)
+								.padding(.vertical, 8)
+								.background(Color.red.opacity(0.8))
+								.cornerRadius(8)
+							}
+							.disabled(speechManager.fullTranscript.isEmpty)
+							
+							// Share transcript
+							Button(action: {
+								let transcript = speechManager.saveTranscript()
+								let av = UIActivityViewController(activityItems: [transcript], applicationActivities: nil)
+								if let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
+								   let window = windowScene.windows.first {
+									window.rootViewController?.present(av, animated: true)
+								}
+							}) {
+								HStack(spacing: 8) {
+									Image(systemName: "square.and.arrow.up")
+									Text("Share")
+								}
+								.foregroundColor(.white)
+								.padding(.horizontal, 16)
+								.padding(.vertical, 8)
+								.background(Color.blue.opacity(0.8))
+								.cornerRadius(8)
+							}
+							.disabled(speechManager.fullTranscript.isEmpty)
+							
+							// Toggle transcription
+							Button(action: {
+								speechManager.toggleContinuousMode()
+							}) {
+								HStack(spacing: 8) {
+									Image(systemName: speechManager.isTranscribing ? "stop.circle" : "play.circle")
+									Text(speechManager.isTranscribing ? "Stop" : "Start")
+								}
+								.foregroundColor(.white)
+								.padding(.horizontal, 16)
+								.padding(.vertical, 8)
+								.background(speechManager.isTranscribing ? Color.red.opacity(0.8) : Color.green.opacity(0.8))
+								.cornerRadius(8)
+							}
+						}
+					}
+					.padding()
+					.background(Color.black.opacity(0.9))
+					.cornerRadius(15)
+					.frame(maxWidth: 400)
 				}
 			}
 			.ignoresSafeArea()
