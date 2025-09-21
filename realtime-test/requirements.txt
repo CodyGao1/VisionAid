@@ -1,0 +1,27 @@
+# OpenAI Realtime Voice Chat - Python Dependencies
+
+# WebSocket client for OpenAI Realtime API
+websockets==12.0
+
+# Audio recording and playback
+PyAudio==0.2.14
+
+# SSL certificate handling (fixes SSL issues on macOS)
+certifi>=2023.7.22
+
+# JSON handling (built into Python, but listed for clarity)
+# json - built-in
+
+# Base64 encoding (built into Python)  
+# base64 - built-in
+
+# Threading and async support (built into Python)
+# asyncio - built-in
+# threading - built-in
+# queue - built-in
+
+# Signal handling (built into Python)
+# signal - built-in
+
+# Type hints (built into Python 3.5+)
+# typing - built-in
