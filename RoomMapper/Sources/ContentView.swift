@@ -6,6 +6,7 @@ import simd
 import CoreMotion
 import Speech
 import Foundation
+import UIKit
 
 class SpatialAudioManager: ObservableObject {
 	private let audioEngine = AVAudioEngine()
@@ -319,9 +320,13 @@ class SpatialAudioManager: ObservableObject {
 		
 		// Use ARKit's built-in projection method
 		let camera = frame.camera
-		let screenPoint = camera.projectPoint(worldPos, 
-											  orientation: .portrait, 
-											  viewportSize: CGSize(width: viewBounds.width, height: viewBounds.height))
+		// Determine the current interface orientation for accurate projection
+		let interfaceOrientation: UIInterfaceOrientation = (UIApplication.shared.connectedScenes.first as? UIWindowScene)?.interfaceOrientation ?? .portrait
+		let screenPoint = camera.projectPoint(
+			worldPos,
+			orientation: interfaceOrientation,
+			viewportSize: CGSize(width: viewBounds.width, height: viewBounds.height)
+		)
 		
 		// Check if the point is within the screen bounds
 		if screenPoint.x >= 0 && screenPoint.x <= viewBounds.width && 
@@ -441,6 +446,23 @@ class SpatialAudioManager: ObservableObject {
 		}
 	}
 	
+	func clearTarget() {
+		print("🚫 Clearing target")
+		
+		// Stop any pinging
+		stopPinging()
+		
+		// Clear target positions
+		targetWorldPosition = nil
+		targetScreenPosition = nil
+		
+		// Clear detection indicators
+		detectedObjectScreenPosition = nil
+		detectedBoundingBox = nil
+		
+		print("✅ Target cleared")
+	}
+	
 	func stopHeadTracking() {
 		if isHeadTrackingActive {
 			headTracker.stopDeviceMotionUpdates()
@@ -531,6 +553,11 @@ class WaypointManager: ObservableObject {
 	func setActiveWaypoint(_ waypoint: Waypoint) {
 		activeWaypoint = waypoint
 		print("🎯 Set active waypoint: '\(waypoint.name)'")
+	}
+	
+	func clearActiveWaypoint() {
+		activeWaypoint = nil
+		print("🚫 Cleared active waypoint")
 	}
 	
 	func findWaypoint(byName name: String) -> Waypoint? {
@@ -873,8 +900,6 @@ class SpeechManager: ObservableObject {
 }
 
 struct ContentView: View {
-	@State private var serverURLString: String = UserDefaults.standard.string(forKey: "serverURL") ?? "ws://192.168.1.100:8765"
-	@State private var isStreaming: Bool = false
 	@StateObject private var spatialAudioManager = SpatialAudioManager()
 	@StateObject private var objectDetectionManager = ObjectDetectionManager()
 	@StateObject private var speechManager = SpeechManager()
@@ -882,21 +907,6 @@ struct ContentView: View {
 
 	var body: some View {
 		VStack(spacing: 0) {
-			HStack {
-				TextField("ws://host:8765", text: $serverURLString)
-					.textFieldStyle(.roundedBorder)
-					.keyboardType(.URL)
-					.textInputAutocapitalization(.never)
-					.disableAutocorrection(true)
-				Button(isStreaming ? "Stop" : "Start") {
-					isStreaming.toggle()
-					UserDefaults.standard.set(serverURLString, forKey: "serverURL")
-					NotificationCenter.default.post(name: .streamToggle, object: nil, userInfo: ["on": isStreaming, "url": serverURLString])
-				}
-			}
-			.padding(8)
-			.background(Color(.secondarySystemBackground))
-
 			ZStack {
 				ARViewContainer(
 					spatialAudioManager: spatialAudioManager,
@@ -1098,6 +1108,26 @@ struct ContentView: View {
 									.cornerRadius(25)
 							}
 						}
+						
+						// Clear target button (only show when target is active)
+						if spatialAudioManager.isPlayingPing || waypointManager.activeWaypoint != nil {
+							Button(action: {
+								spatialAudioManager.clearTarget()
+								waypointManager.clearActiveWaypoint()
+							}) {
+								HStack(spacing: 8) {
+									Image(systemName: "xmark.circle")
+										.font(.system(size: 16))
+									Text("Clear Target")
+										.font(.system(size: 16, weight: .medium))
+								}
+								.foregroundColor(.white)
+								.padding(.horizontal, 20)
+								.padding(.vertical, 12)
+								.background(Color.red.opacity(0.8))
+								.cornerRadius(25)
+							}
+						}
 					}
 					
 					// Status messages
@@ -1245,6 +1275,7 @@ struct ContentView: View {
 					.frame(maxWidth: 300)
 				}
 			}
+			.ignoresSafeArea()
 		}
 	}
 	
@@ -1257,7 +1288,6 @@ struct ContentView: View {
 }
 
 extension Notification.Name {
-	static let streamToggle = Notification.Name("streamToggle")
 	static let setTargetCenter = Notification.Name("setTargetCenter")
 	static let detectObject = Notification.Name("detectObject")
 	static let addWaypoint = Notification.Name("addWaypoint")
@@ -1294,10 +1324,6 @@ struct ARViewContainer: UIViewRepresentable {
 		context.coordinator.setWaypointManager(waypointManager)
 		context.coordinator.setARView(arView)
 
-		NotificationCenter.default.addObserver(forName: .streamToggle, object: nil, queue: .main) { note in
-			guard let on = note.userInfo?["on"] as? Bool, let url = note.userInfo?["url"] as? String else { return }
-			context.coordinator.setStreaming(on: on, urlString: url)
-		}
 		
 		NotificationCenter.default.addObserver(forName: .setTargetCenter, object: nil, queue: .main) { _ in
 			context.coordinator.setTargetAtCenter(arView: arView)
@@ -1320,13 +1346,6 @@ struct ARViewContainer: UIViewRepresentable {
 	func makeCoordinator() -> Coordinator { Coordinator() }
 
 	final class Coordinator: NSObject, ARSessionDelegate {
-		private var webSocketTask: URLSessionWebSocketTask?
-		private let session = URLSession(configuration: .default)
-		private var isStreaming: Bool = false
-		private let sendQueue = DispatchQueue(label: "roommapper.stream.queue", qos: .userInitiated)
-		private var lastSentByAnchor: [UUID: TimeInterval] = [:]
-		private let minSendInterval: TimeInterval = 0.4 // seconds per anchor
-		private let pointDownsample: Int = 3 // take every Nth vertex
 		private var spatialAudioManager: SpatialAudioManager?
 		private var objectDetectionManager: ObjectDetectionManager?
 		private var waypointManager: WaypointManager?
@@ -1354,27 +1373,33 @@ struct ARViewContainer: UIViewRepresentable {
 			// Get the center point of the screen
 			let screenCenter = CGPoint(x: arView.bounds.midX, y: arView.bounds.midY)
 			
-			// Perform hit test from the center of the screen
-			let hitTestResults = arView.hitTest(screenCenter, types: [.existingPlaneUsingExtent, .estimatedHorizontalPlane, .featurePoint])
+			// Prefer raycast for accuracy (supports vertical and horizontal planes)
+			if let raycastResult = arView.raycast(from: screenCenter, allowing: .estimatedPlane, alignment: .any).first {
+				let worldTransform = raycastResult.worldTransform
+				let worldPosition = simd_float3(worldTransform.columns.3.x, worldTransform.columns.3.y, worldTransform.columns.3.z)
+				spatialAudioManager?.setTarget(worldPosition: worldPosition)
+				print("Target set via raycast at world position: \(worldPosition)")
+				return
+			}
+			
+			// Fallback to classic hitTest with broader types (including vertical planes)
+			let hitTestResults = arView.hitTest(
+				screenCenter,
+				types: [.existingPlaneUsingExtent, .existingPlane, .estimatedHorizontalPlane, .estimatedVerticalPlane, .featurePoint]
+			)
 			
 			if let result = hitTestResults.first {
-				// Convert hit test result to world position
 				let worldTransform = result.worldTransform
 				let worldPosition = simd_float3(worldTransform.columns.3.x, worldTransform.columns.3.y, worldTransform.columns.3.z)
-				
-				// Set the target in the spatial audio manager
 				spatialAudioManager?.setTarget(worldPosition: worldPosition)
-				
-				print("Target set at world position: \(worldPosition)")
+				print("Target set via hitTest at world position: \(worldPosition)")
 			} else {
-				// Fallback: set target 1 meter in front of the camera
+				// Final fallback: set target 1 meter in front of the camera
 				let cameraTransform = frame.camera.transform
 				let cameraPosition = simd_float3(cameraTransform.columns.3.x, cameraTransform.columns.3.y, cameraTransform.columns.3.z)
 				let cameraForward = -simd_float3(cameraTransform.columns.2.x, cameraTransform.columns.2.y, cameraTransform.columns.2.z)
 				let targetPosition = cameraPosition + cameraForward * 1.0
-				
 				spatialAudioManager?.setTarget(worldPosition: targetPosition)
-				
 				print("Target set at fallback position: \(targetPosition)")
 			}
 		}
@@ -1685,15 +1710,6 @@ struct ARViewContainer: UIViewRepresentable {
 			print("Object target set at fallback position: \(targetPosition)")
 		}
 
-		func setStreaming(on: Bool, urlString: String) {
-			isStreaming = on
-			webSocketTask?.cancel(with: .goingAway, reason: nil)
-			webSocketTask = nil
-			lastSentByAnchor.removeAll()
-			guard on, let url = URL(string: urlString) else { return }
-			webSocketTask = session.webSocketTask(with: url)
-			webSocketTask?.resume()
-		}
 
 		func session(_ session: ARSession, didUpdate frame: ARFrame) {
 			// Extract data we need immediately to avoid retaining the frame
@@ -1714,101 +1730,9 @@ struct ARViewContainer: UIViewRepresentable {
 			// Don't hold onto the frame reference beyond this point
 		}
 
-		func session(_ session: ARSession, didAdd anchors: [ARAnchor]) { handle(anchors: anchors) }
-		func session(_ session: ARSession, didUpdate anchors: [ARAnchor]) { handle(anchors: anchors) }
+		func session(_ session: ARSession, didAdd anchors: [ARAnchor]) { }
+		func session(_ session: ARSession, didUpdate anchors: [ARAnchor]) { }
 
-		private func handle(anchors: [ARAnchor]) {
-			guard isStreaming, let ws = webSocketTask else { return }
-			let now = CACurrentMediaTime()
-			for anchor in anchors {
-				guard let meshAnchor = anchor as? ARMeshAnchor else { continue }
-				let last = lastSentByAnchor[meshAnchor.identifier] ?? 0
-				if now - last < minSendInterval { continue }
-				lastSentByAnchor[meshAnchor.identifier] = now
-				let geometry = meshAnchor.geometry
-				// Extract data immediately to avoid retaining anchor/geometry references
-				let vertices = geometry.vertices.asArray()
-				let anchorId = meshAnchor.identifier.uuidString
-				let transform = meshAnchor.transform
-				
-				sendQueue.async { [weak self] in
-					guard let self = self else { return }
-					var verts = vertices
-					// Downsample points by taking every Nth triplet
-					if self.pointDownsample > 1 && !verts.isEmpty {
-						var reduced: [Float] = []
-						reduced.reserveCapacity(verts.count / self.pointDownsample)
-						for i in stride(from: 0, to: verts.count, by: self.pointDownsample * 3) {
-							guard i + 2 < verts.count else { break }
-							reduced.append(verts[i]); reduced.append(verts[i+1]); reduced.append(verts[i+2])
-						}
-						verts = reduced
-					}
-					let transformArray: [Float] = [
-						transform.columns.0.x, transform.columns.0.y, transform.columns.0.z, transform.columns.0.w,
-						transform.columns.1.x, transform.columns.1.y, transform.columns.1.z, transform.columns.1.w,
-						transform.columns.2.x, transform.columns.2.y, transform.columns.2.z, transform.columns.2.w,
-						transform.columns.3.x, transform.columns.3.y, transform.columns.3.z, transform.columns.3.w
-					]
-					let msg: [String: Any] = [
-						"type": "point-cloud",
-						"anchorId": anchorId,
-						"transform": transformArray,
-						"points": verts
-					]
-					do {
-						let data = try JSONSerialization.data(withJSONObject: msg, options: [])
-						ws.send(.data(data)) { error in
-							if let error = error { print("WebSocket send error: \(error)") }
-						}
-					} catch {
-						print("JSON encode error: \(error)")
-					}
-				}
-			}
-		}
 	}
 }
 
-private extension ARGeometrySource {
-	func asArray() -> [Float] {
-		let stride = self.stride
-		let offset = self.offset
-		let count = self.count
-		var result = [Float]()
-		result.reserveCapacity(count * 3)
-		let buffer = self.buffer.contents()
-		for i in 0..<count {
-			let base = buffer.advanced(by: offset + i * stride)
-			let f = base.bindMemory(to: Float.self, capacity: 3)
-			result.append(f[0]); result.append(f[1]); result.append(f[2])
-		}
-		return result
-	}
-}
-
-private extension ARGeometryElement {
-	// No longer used; kept for reference if mesh streaming is restored
-	func asArrayUInt32() -> [UInt32] {
-		let primitives = self.count
-		let indicesPerPrim = self.indexCountPerPrimitive
-		var out = [UInt32]()
-		out.reserveCapacity(primitives * indicesPerPrim)
-		let buffer = self.buffer.contents()
-		let startOffset = 0
-		if self.bytesPerIndex == 2 {
-			for i in 0..<(primitives * indicesPerPrim) {
-				let base = buffer.advanced(by: startOffset + i * 2)
-				let v = UInt32(base.bindMemory(to: UInt16.self, capacity: 1).pointee)
-				out.append(v)
-			}
-		} else {
-			for i in 0..<(primitives * indicesPerPrim) {
-				let base = buffer.advanced(by: startOffset + i * 4)
-				let v = base.bindMemory(to: UInt32.self, capacity: 1).pointee
-				out.append(v)
-			}
-		}
-		return out
-	}
-}
