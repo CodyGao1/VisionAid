@@ -8,6 +8,244 @@ import Speech
 import Foundation
 import UIKit
 
+// MARK: - Proximity Detection with Haptic Feedback
+class ProximityDetectionManager: ObservableObject {
+	private let lightHaptic = UIImpactFeedbackGenerator(style: .light)
+	private let mediumHaptic = UIImpactFeedbackGenerator(style: .medium)
+	private let heavyHaptic = UIImpactFeedbackGenerator(style: .heavy)
+	private let rigidHaptic = UIImpactFeedbackGenerator(style: .rigid)
+	
+	@Published var isEnabled = false
+	@Published var currentDistance: Float = 10.0
+	@Published var isProximityActive = false
+	
+	// Detection parameters
+	private let maxDetectionDistance: Float = 3.0 // meters
+	private let minDetectionDistance: Float = 0.2 // meters
+	private let veryCloseDistance: Float = 0.5 // meters - trigger heavy feedback
+	private let closeDistance: Float = 1.0 // meters - trigger medium feedback
+	private let mediumDistance: Float = 2.0 // meters - trigger light feedback
+	
+	// Timing control
+	private var lastHapticTime: TimeInterval = 0
+	private var currentHapticInterval: TimeInterval = 1.0
+	private let maxHapticInterval: TimeInterval = 1.2 // slow when far
+	private let minHapticInterval: TimeInterval = 0.1 // very fast when close
+	
+	// Ray sampling for detection
+	private let rayCount = 5 // Number of rays to cast in front
+	private let raySpread: Float = 0.3 // Radians spread of detection cone
+	
+	init() {
+		// Prepare haptic generators for better responsiveness
+		lightHaptic.prepare()
+		mediumHaptic.prepare()
+		heavyHaptic.prepare()
+		rigidHaptic.prepare()
+	}
+	
+	func toggle() {
+		isEnabled.toggle()
+		if !isEnabled {
+			isProximityActive = false
+			currentDistance = maxDetectionDistance
+		}
+		print("📳 Proximity detection \(isEnabled ? "enabled" : "disabled")")
+	}
+	
+	func updateProximity(frame: ARFrame, arView: ARView) {
+		guard isEnabled else { return }
+		
+		let nearestDistance = detectNearestObstacle(frame: frame, arView: arView)
+		
+		DispatchQueue.main.async { [weak self] in
+			self?.currentDistance = nearestDistance
+			self?.updateHapticFeedback(distance: nearestDistance)
+		}
+	}
+	
+	private func detectNearestObstacle(frame: ARFrame, arView: ARView) -> Float {
+		var minDistance: Float = maxDetectionDistance
+		
+		let cameraTransform = frame.camera.transform
+		let cameraPosition = simd_float3(cameraTransform.columns.3.x, cameraTransform.columns.3.y, cameraTransform.columns.3.z)
+		let forward = -simd_float3(cameraTransform.columns.2.x, cameraTransform.columns.2.y, cameraTransform.columns.2.z)
+		
+		// Method 1: Try scene reconstruction first (most accurate)
+		let meshAnchors = frame.anchors.compactMap({ $0 as? ARMeshAnchor })
+		if !meshAnchors.isEmpty {
+			for meshAnchor in meshAnchors {
+				let distance = checkMeshDistance(cameraPosition: cameraPosition, forward: forward, meshAnchor: meshAnchor)
+				minDistance = min(minDistance, distance)
+			}
+		}
+		
+		// Method 2: Use depth data if available
+		if minDistance >= maxDetectionDistance, let depthData = frame.sceneDepth {
+			let depthDistance = checkDepthDistance(frame: frame, arView: arView, depthData: depthData)
+			minDistance = min(minDistance, depthDistance)
+		}
+		
+		// Method 3: Raycast fallback
+		if minDistance >= maxDetectionDistance {
+			let raycastDistance = checkRaycastDistance(arView: arView, cameraPosition: cameraPosition, forward: forward)
+			minDistance = min(minDistance, raycastDistance)
+		}
+		
+		return max(minDetectionDistance, minDistance)
+	}
+	
+	private func checkMeshDistance(cameraPosition: simd_float3, forward: simd_float3, meshAnchor: ARMeshAnchor) -> Float {
+		let meshTransform = meshAnchor.transform
+		let geometry = meshAnchor.geometry
+		
+		// Sample points from the mesh and find closest in forward direction
+		var minDistance: Float = maxDetectionDistance
+		
+		// Cast multiple rays in a cone pattern
+		for i in 0..<rayCount {
+			let angle = (Float(i) - Float(rayCount) / 2.0) * raySpread / Float(rayCount)
+			let rayDirection = rotateVectorAroundY(forward, angle: angle)
+			
+			// Simple ray-mesh intersection approximation
+			// Check distance to mesh anchor position as a quick approximation
+			let meshPosition = simd_float3(meshTransform.columns.3.x, meshTransform.columns.3.y, meshTransform.columns.3.z)
+			let toMesh = meshPosition - cameraPosition
+			let distance = simd_length(toMesh)
+			
+			// Only consider if mesh is roughly in forward direction
+			let dot = simd_dot(simd_normalize(toMesh), rayDirection)
+			if dot > 0.5 && distance < maxDetectionDistance {
+				minDistance = min(minDistance, distance)
+			}
+		}
+		
+		return minDistance
+	}
+	
+	private func checkDepthDistance(frame: ARFrame, arView: ARView, depthData: ARDepthData) -> Float {
+		let depthMap = depthData.depthMap
+		CVPixelBufferLockBaseAddress(depthMap, .readOnly)
+		defer { CVPixelBufferUnlockBaseAddress(depthMap, .readOnly) }
+		
+		let width = CVPixelBufferGetWidth(depthMap)
+		let height = CVPixelBufferGetHeight(depthMap)
+		let baseAddress = CVPixelBufferGetBaseAddress(depthMap)?.assumingMemoryBound(to: Float32.self)
+		let bytesPerRow = CVPixelBufferGetBytesPerRow(depthMap)
+		
+		var minDepth: Float = maxDetectionDistance
+		
+		// Sample multiple points in the center region of the depth map
+		let centerRegionSize: Float = 0.3 // 30% of screen around center
+		let widthFloat = Float(width)
+		let heightFloat = Float(height)
+		let startX = Int(widthFloat * (0.5 - centerRegionSize / 2.0))
+		let endX = Int(widthFloat * (0.5 + centerRegionSize / 2.0))
+		let startY = Int(heightFloat * (0.5 - centerRegionSize / 2.0))
+		let endY = Int(heightFloat * (0.5 + centerRegionSize / 2.0))
+		
+		for y in stride(from: startY, to: endY, by: 5) {
+			for x in stride(from: startX, to: endX, by: 5) {
+				if let depth = baseAddress?[y * (bytesPerRow / 4) + x] {
+					if depth > 0 && depth < maxDetectionDistance {
+						minDepth = min(minDepth, depth)
+					}
+				}
+			}
+		}
+		
+		return minDepth
+	}
+	
+	private func checkRaycastDistance(arView: ARView, cameraPosition: simd_float3, forward: simd_float3) -> Float {
+		var minDistance: Float = maxDetectionDistance
+		
+		// Cast rays from screen center and nearby points
+		let screenCenter = CGPoint(x: arView.bounds.midX, y: arView.bounds.midY)
+		let raycastPoints = [
+			screenCenter,
+			CGPoint(x: screenCenter.x - 50, y: screenCenter.y),
+			CGPoint(x: screenCenter.x + 50, y: screenCenter.y),
+			CGPoint(x: screenCenter.x, y: screenCenter.y - 50),
+			CGPoint(x: screenCenter.x, y: screenCenter.y + 50)
+		]
+		
+		for point in raycastPoints {
+			let raycastResults = arView.raycast(from: point, allowing: .estimatedPlane, alignment: .any)
+			if let result = raycastResults.first {
+				let hitPosition = simd_float3(result.worldTransform.columns.3.x, result.worldTransform.columns.3.y, result.worldTransform.columns.3.z)
+				let distance = simd_distance(cameraPosition, hitPosition)
+				minDistance = min(minDistance, distance)
+			}
+		}
+		
+		return minDistance
+	}
+	
+	private func rotateVectorAroundY(_ vector: simd_float3, angle: Float) -> simd_float3 {
+		let cosAngle = cos(angle)
+		let sinAngle = sin(angle)
+		return simd_float3(
+			vector.x * cosAngle + vector.z * sinAngle,
+			vector.y,
+			-vector.x * sinAngle + vector.z * cosAngle
+		)
+	}
+	
+	private func updateHapticFeedback(distance: Float) {
+		let now = CACurrentMediaTime()
+		
+		// Calculate haptic interval based on distance (closer = faster vibrations)
+		let distanceRange = maxDetectionDistance - minDetectionDistance
+		let adjustedDistance = distance - minDetectionDistance
+		let clampedDistance = min(1.0, max(0.0, adjustedDistance / distanceRange))
+		
+		let exponentialDistance = clampedDistance * clampedDistance
+		let intervalRange = maxHapticInterval - minHapticInterval
+		let interval = minHapticInterval + intervalRange * TimeInterval(exponentialDistance)
+		
+		currentHapticInterval = interval
+		
+		// Only trigger haptic if enough time has passed
+		guard now - lastHapticTime >= interval else { return }
+		lastHapticTime = now
+		
+		// Determine feedback intensity based on distance
+		if distance <= veryCloseDistance {
+			// Very close - rigid/heavy feedback
+			isProximityActive = true
+			if distance <= minDetectionDistance * 2 {
+				rigidHaptic.impactOccurred(intensity: 1.0)
+			} else {
+				heavyHaptic.impactOccurred(intensity: 1.0)
+			}
+		} else if distance <= closeDistance {
+			// Close - medium feedback
+			isProximityActive = true
+			let distanceRatio = (distance - veryCloseDistance) / (closeDistance - veryCloseDistance)
+			let intensity = 0.5 + 0.5 * (1.0 - distanceRatio)
+			mediumHaptic.impactOccurred(intensity: CGFloat(intensity))
+		} else if distance <= mediumDistance {
+			// Medium distance - light feedback
+			isProximityActive = true
+			let distanceRatio = (distance - closeDistance) / (mediumDistance - closeDistance)
+			let intensity = 0.3 + 0.4 * (1.0 - distanceRatio)
+			lightHaptic.impactOccurred(intensity: CGFloat(intensity))
+		} else {
+			// Far away - no feedback
+			isProximityActive = false
+		}
+		
+		// Prepare generators for next use
+		if isProximityActive {
+			lightHaptic.prepare()
+			mediumHaptic.prepare()
+			heavyHaptic.prepare()
+			rigidHaptic.prepare()
+		}
+	}
+}
+
 class SpatialAudioManager: ObservableObject {
 	private let audioEngine = AVAudioEngine()
 	private let environmentNode = AVAudioEnvironmentNode()
@@ -935,6 +1173,7 @@ struct ContentView: View {
 	@StateObject private var objectDetectionManager = ObjectDetectionManager()
 	@StateObject private var speechManager = SpeechManager()
 	@StateObject private var waypointManager = WaypointManager()
+	@StateObject private var proximityManager = ProximityDetectionManager()
 
 	var body: some View {
 		VStack(spacing: 0) {
@@ -943,7 +1182,8 @@ struct ContentView: View {
 					spatialAudioManager: spatialAudioManager,
 					objectDetectionManager: objectDetectionManager,
 					speechManager: speechManager,
-					waypointManager: waypointManager
+					waypointManager: waypointManager,
+					proximityManager: proximityManager
 				)
 				.ignoresSafeArea()
 				
@@ -1140,6 +1380,23 @@ struct ContentView: View {
 							}
 						}
 						
+						// Proximity detection toggle
+						Button(action: {
+							proximityManager.toggle()
+						}) {
+							HStack(spacing: 8) {
+								Image(systemName: proximityManager.isEnabled ? "iphone.radiowaves.left.and.right" : "iphone")
+									.font(.system(size: 16))
+								Text(proximityManager.isEnabled ? "Proximity ON" : "Proximity OFF")
+									.font(.system(size: 16, weight: .medium))
+							}
+							.foregroundColor(.white)
+							.padding(.horizontal, 20)
+							.padding(.vertical, 12)
+							.background(proximityManager.isEnabled ? Color.orange.opacity(0.8) : Color.gray.opacity(0.6))
+							.cornerRadius(25)
+						}
+						
 						// Clear target button (only show when target is active)
 						if spatialAudioManager.isPlayingPing || waypointManager.activeWaypoint != nil {
 							Button(action: {
@@ -1180,6 +1437,34 @@ struct ContentView: View {
 							.background(Color.green.opacity(0.8))
 							.cornerRadius(15)
 							.padding(.top, 10)
+					}
+					
+					// Proximity detection status
+					if proximityManager.isEnabled {
+						VStack(spacing: 5) {
+							HStack(spacing: 8) {
+								Text("📳")
+									.font(.system(size: 12))
+								Text("Proximity Detection")
+									.font(.system(size: 12, weight: .medium))
+								if proximityManager.isProximityActive {
+									Circle()
+										.fill(Color.red)
+										.frame(width: 8, height: 8)
+										.animation(.easeInOut(duration: 0.3), value: proximityManager.isProximityActive)
+								}
+							}
+							.foregroundColor(.white)
+							
+							Text(String(format: "Distance: %.1fm", proximityManager.currentDistance))
+								.font(.system(size: 11))
+								.foregroundColor(.white.opacity(0.8))
+						}
+						.padding(.horizontal, 16)
+						.padding(.vertical, 8)
+						.background(proximityManager.isProximityActive ? Color.red.opacity(0.8) : Color.orange.opacity(0.6))
+						.cornerRadius(15)
+						.padding(.top, 5)
 					}
 					
 					// Speech recognition text
@@ -1329,6 +1614,7 @@ struct ARViewContainer: UIViewRepresentable {
 	let objectDetectionManager: ObjectDetectionManager
 	let speechManager: SpeechManager
 	let waypointManager: WaypointManager
+	let proximityManager: ProximityDetectionManager
 	
 	func makeUIView(context: Context) -> ARView {
 		let arView = ARView(frame: .zero)
@@ -1353,6 +1639,7 @@ struct ARViewContainer: UIViewRepresentable {
 		context.coordinator.setSpatialAudioManager(spatialAudioManager)
 		context.coordinator.setObjectDetectionManager(objectDetectionManager)
 		context.coordinator.setWaypointManager(waypointManager)
+		context.coordinator.setProximityManager(proximityManager)
 		context.coordinator.setARView(arView)
 
 		
@@ -1381,6 +1668,7 @@ struct ARViewContainer: UIViewRepresentable {
 		private var spatialAudioManager: SpatialAudioManager?
 		private var objectDetectionManager: ObjectDetectionManager?
 		private var waypointManager: WaypointManager?
+		private var proximityManager: ProximityDetectionManager?
 		private var arView: ARView?
 
 		func setSpatialAudioManager(_ manager: SpatialAudioManager) {
@@ -1393,6 +1681,10 @@ struct ARViewContainer: UIViewRepresentable {
 		
 		func setWaypointManager(_ manager: WaypointManager) {
 			waypointManager = manager
+		}
+		
+		func setProximityManager(_ manager: ProximityDetectionManager) {
+			proximityManager = manager
 		}
 		
 		func setARView(_ view: ARView) {
@@ -1696,6 +1988,9 @@ struct ARViewContainer: UIViewRepresentable {
 					frame: currentFrame,
 					viewBounds: arView.bounds
 				)
+				
+				// Update proximity detection
+				proximityManager?.updateProximity(frame: currentFrame, arView: arView)
 			}
 			
 			// Don't hold onto the frame reference beyond this point
