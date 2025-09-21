@@ -455,6 +455,131 @@ class SpatialAudioManager: ObservableObject {
 	}
 }
 
+// MARK: - Waypoint Management
+extension simd_float3: Codable {
+	public func encode(to encoder: Encoder) throws {
+		var container = encoder.unkeyedContainer()
+		try container.encode(x)
+		try container.encode(y)
+		try container.encode(z)
+	}
+	
+	public init(from decoder: Decoder) throws {
+		var container = try decoder.unkeyedContainer()
+		let x = try container.decode(Float.self)
+		let y = try container.decode(Float.self)
+		let z = try container.decode(Float.self)
+		self.init(x, y, z)
+	}
+}
+
+struct Waypoint: Identifiable, Codable {
+	let id = UUID()
+	let name: String
+	let worldPosition: simd_float3
+	let dateCreated: Date
+	
+	init(name: String, worldPosition: simd_float3) {
+		self.name = name
+		self.worldPosition = worldPosition
+		self.dateCreated = Date()
+	}
+}
+
+class WaypointManager: ObservableObject {
+	@Published var waypoints: [Waypoint] = []
+	@Published var activeWaypoint: Waypoint?
+	@Published var isShowingWaypointList = false
+	@Published var isCreatingWaypoint = false
+	@Published var pendingWaypointPosition: simd_float3?
+	@Published var waypointNameInput = ""
+	
+	private let waypointsKey = "SavedWaypoints"
+	
+	init() {
+		loadWaypoints()
+	}
+	
+	func createWaypoint(at position: simd_float3, name: String) {
+		let waypoint = Waypoint(name: name.trimmingCharacters(in: .whitespacesAndNewlines), worldPosition: position)
+		waypoints.append(waypoint)
+		saveWaypoints()
+		print("📍 Created waypoint '\(waypoint.name)' at \(position)")
+	}
+	
+	func deleteWaypoint(_ waypoint: Waypoint) {
+		waypoints.removeAll { $0.id == waypoint.id }
+		if activeWaypoint?.id == waypoint.id {
+			activeWaypoint = nil
+		}
+		saveWaypoints()
+		print("🗑️ Deleted waypoint '\(waypoint.name)'")
+	}
+	
+	func renameWaypoint(_ waypoint: Waypoint, to newName: String) {
+		if let index = waypoints.firstIndex(where: { $0.id == waypoint.id }) {
+			let updatedWaypoint = Waypoint(name: newName.trimmingCharacters(in: .whitespacesAndNewlines), worldPosition: waypoint.worldPosition)
+			waypoints[index] = updatedWaypoint
+			if activeWaypoint?.id == waypoint.id {
+				activeWaypoint = updatedWaypoint
+			}
+			saveWaypoints()
+			print("✏️ Renamed waypoint to '\(newName)'")
+		}
+	}
+	
+	func setActiveWaypoint(_ waypoint: Waypoint) {
+		activeWaypoint = waypoint
+		print("🎯 Set active waypoint: '\(waypoint.name)'")
+	}
+	
+	func findWaypoint(byName name: String) -> Waypoint? {
+		let searchName = name.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+		return waypoints.first { waypoint in
+			waypoint.name.lowercased().contains(searchName) || searchName.contains(waypoint.name.lowercased())
+		}
+	}
+	
+	func startCreatingWaypoint(at position: simd_float3) {
+		pendingWaypointPosition = position
+		waypointNameInput = ""
+		isCreatingWaypoint = true
+	}
+	
+	func cancelWaypointCreation() {
+		pendingWaypointPosition = nil
+		waypointNameInput = ""
+		isCreatingWaypoint = false
+	}
+	
+	func finishWaypointCreation() {
+		guard let position = pendingWaypointPosition, !waypointNameInput.isEmpty else { return }
+		createWaypoint(at: position, name: waypointNameInput)
+		cancelWaypointCreation()
+	}
+	
+	private func saveWaypoints() {
+		do {
+			let encoder = JSONEncoder()
+			let data = try encoder.encode(waypoints)
+			UserDefaults.standard.set(data, forKey: waypointsKey)
+		} catch {
+			print("Failed to save waypoints: \(error)")
+		}
+	}
+	
+	private func loadWaypoints() {
+		guard let data = UserDefaults.standard.data(forKey: waypointsKey) else { return }
+		do {
+			let decoder = JSONDecoder()
+			waypoints = try decoder.decode([Waypoint].self, from: data)
+			print("📍 Loaded \(waypoints.count) saved waypoints")
+		} catch {
+			print("Failed to load waypoints: \(error)")
+		}
+	}
+}
+
 // MARK: - Object Detection Models
 struct BoundingBox: Codable {
 	let box_2d: [Int]
@@ -753,6 +878,7 @@ struct ContentView: View {
 	@StateObject private var spatialAudioManager = SpatialAudioManager()
 	@StateObject private var objectDetectionManager = ObjectDetectionManager()
 	@StateObject private var speechManager = SpeechManager()
+	@StateObject private var waypointManager = WaypointManager()
 
 	var body: some View {
 		VStack(spacing: 0) {
@@ -775,7 +901,8 @@ struct ContentView: View {
 				ARViewContainer(
 					spatialAudioManager: spatialAudioManager,
 					objectDetectionManager: objectDetectionManager,
-					speechManager: speechManager
+					speechManager: speechManager,
+					waypointManager: waypointManager
 				)
 				.ignoresSafeArea()
 				
@@ -887,44 +1014,89 @@ struct ContentView: View {
 				VStack {
 					Spacer()
 					
-					// Voice command button and manual target button
-					HStack(spacing: 15) {
-						// Voice command button
-						Button(action: {
-							if speechManager.isListening {
-								speechManager.stopListening()
-								// Process the recognized text
-								if !speechManager.recognizedText.isEmpty {
-									NotificationCenter.default.post(name: .detectObject, object: nil, userInfo: ["target": speechManager.recognizedText])
+					// Voice command button and waypoint buttons
+					VStack(spacing: 12) {
+						HStack(spacing: 15) {
+							// Voice command button
+							Button(action: {
+								if speechManager.isListening {
+									speechManager.stopListening()
+									// Process the recognized text
+									if !speechManager.recognizedText.isEmpty {
+										// Check if it's a waypoint navigation command first
+										if let waypoint = waypointManager.findWaypoint(byName: speechManager.recognizedText) {
+											waypointManager.setActiveWaypoint(waypoint)
+											spatialAudioManager.setTarget(worldPosition: waypoint.worldPosition)
+										} else {
+											// Fall back to object detection
+											NotificationCenter.default.post(name: .detectObject, object: nil, userInfo: ["target": speechManager.recognizedText])
+										}
+									}
+								} else {
+									speechManager.startListening()
 								}
-							} else {
-								speechManager.startListening()
-							}
-						}) {
-							HStack(spacing: 8) {
-								Image(systemName: speechManager.isListening ? "mic.fill" : "mic")
-									.font(.system(size: 16))
-								Text(speechManager.isListening ? "Listening..." : "Find Object")
-									.font(.system(size: 16, weight: .medium))
-							}
-							.foregroundColor(.white)
-							.padding(.horizontal, 20)
-							.padding(.vertical, 12)
-							.background(speechManager.isListening ? Color.red.opacity(0.8) : Color.blue.opacity(0.8))
-							.cornerRadius(25)
-						}
-						
-						// Manual target button
-						Button(action: {
-							NotificationCenter.default.post(name: .setTargetCenter, object: nil)
-						}) {
-							Text("Set Target (Center)")
-								.font(.system(size: 16, weight: .medium))
+							}) {
+								HStack(spacing: 8) {
+									Image(systemName: speechManager.isListening ? "mic.fill" : "mic")
+										.font(.system(size: 16))
+									Text(speechManager.isListening ? "Listening..." : "Voice Command")
+										.font(.system(size: 16, weight: .medium))
+								}
 								.foregroundColor(.white)
 								.padding(.horizontal, 20)
 								.padding(.vertical, 12)
-								.background(Color.black.opacity(0.6))
+								.background(speechManager.isListening ? Color.red.opacity(0.8) : Color.blue.opacity(0.8))
 								.cornerRadius(25)
+							}
+							
+							// Waypoint list button
+							Button(action: {
+								waypointManager.isShowingWaypointList.toggle()
+							}) {
+								HStack(spacing: 8) {
+									Image(systemName: "list.bullet")
+										.font(.system(size: 16))
+									Text("Waypoints")
+										.font(.system(size: 16, weight: .medium))
+								}
+								.foregroundColor(.white)
+								.padding(.horizontal, 20)
+								.padding(.vertical, 12)
+								.background(Color.purple.opacity(0.8))
+								.cornerRadius(25)
+							}
+						}
+						
+						HStack(spacing: 15) {
+							// Add waypoint button
+							Button(action: {
+								NotificationCenter.default.post(name: .addWaypoint, object: nil)
+							}) {
+								HStack(spacing: 8) {
+									Image(systemName: "plus.circle")
+										.font(.system(size: 16))
+									Text("Add Waypoint")
+										.font(.system(size: 16, weight: .medium))
+								}
+								.foregroundColor(.white)
+								.padding(.horizontal, 20)
+								.padding(.vertical, 12)
+								.background(Color.green.opacity(0.8))
+								.cornerRadius(25)
+							}
+							
+							// Manual target button (for temporary targets)
+							Button(action: {
+								NotificationCenter.default.post(name: .setTargetCenter, object: nil)
+							}) {
+								Text("Quick Target")
+									.font(.system(size: 16, weight: .medium))
+									.foregroundColor(.white)
+									.padding(.horizontal, 20)
+									.padding(.vertical, 12)
+									.background(Color.black.opacity(0.6))
+									.cornerRadius(25)
+							}
 						}
 					}
 					
@@ -939,7 +1111,7 @@ struct ContentView: View {
 							.cornerRadius(15)
 							.padding(.top, 10)
 					} else if !objectDetectionManager.lastDetectionResult.isEmpty {
-						Text("✅ \(objectDetectionManager.lastDetectionResult)")
+						Text("\(objectDetectionManager.lastDetectionResult)")
 							.font(.system(size: 14))
 							.foregroundColor(.white)
 							.padding(.horizontal, 16)
@@ -963,8 +1135,124 @@ struct ContentView: View {
 					
 					Spacer().frame(height: 50)
 				}
+				
+				// Waypoint list overlay
+				if waypointManager.isShowingWaypointList {
+					Color.black.opacity(0.4)
+						.ignoresSafeArea()
+						.onTapGesture {
+							waypointManager.isShowingWaypointList = false
+						}
+					
+					VStack(spacing: 20) {
+						Text("📍 Waypoints")
+							.font(.title2)
+							.fontWeight(.bold)
+							.foregroundColor(.white)
+						
+						ScrollView {
+							LazyVStack(spacing: 12) {
+								ForEach(waypointManager.waypoints) { waypoint in
+									HStack {
+										VStack(alignment: .leading) {
+											Text(waypoint.name)
+												.font(.headline)
+												.foregroundColor(.white)
+											Text("Created: \(waypoint.dateCreated, formatter: dateFormatter)")
+												.font(.caption)
+												.foregroundColor(.gray)
+										}
+										
+										Spacer()
+										
+										// Set active button
+										Button(action: {
+											waypointManager.setActiveWaypoint(waypoint)
+											spatialAudioManager.setTarget(worldPosition: waypoint.worldPosition)
+											waypointManager.isShowingWaypointList = false
+										}) {
+											Image(systemName: waypointManager.activeWaypoint?.id == waypoint.id ? "location.fill" : "location")
+												.foregroundColor(waypointManager.activeWaypoint?.id == waypoint.id ? .green : .white)
+										}
+										
+										// Delete button
+										Button(action: {
+											waypointManager.deleteWaypoint(waypoint)
+										}) {
+											Image(systemName: "trash")
+												.foregroundColor(.red)
+										}
+									}
+									.padding()
+									.background(Color.black.opacity(0.6))
+									.cornerRadius(10)
+								}
+							}
+						}
+						.frame(maxHeight: 300)
+						
+						Button("Close") {
+							waypointManager.isShowingWaypointList = false
+						}
+						.foregroundColor(.white)
+						.padding()
+						.background(Color.gray.opacity(0.8))
+						.cornerRadius(10)
+					}
+					.padding()
+					.background(Color.black.opacity(0.8))
+					.cornerRadius(15)
+					.frame(maxWidth: 350)
+				}
+				
+				// Waypoint creation dialog
+				if waypointManager.isCreatingWaypoint {
+					Color.black.opacity(0.4)
+						.ignoresSafeArea()
+					
+					VStack(spacing: 20) {
+						Text("📍 Name Your Waypoint")
+							.font(.title2)
+							.fontWeight(.bold)
+							.foregroundColor(.white)
+						
+						TextField("Enter waypoint name", text: $waypointManager.waypointNameInput)
+							.textFieldStyle(.roundedBorder)
+							.padding(.horizontal)
+						
+						HStack(spacing: 20) {
+							Button("Cancel") {
+								waypointManager.cancelWaypointCreation()
+							}
+							.foregroundColor(.white)
+							.padding()
+							.background(Color.red.opacity(0.8))
+							.cornerRadius(10)
+							
+							Button("Save") {
+								waypointManager.finishWaypointCreation()
+							}
+							.foregroundColor(.white)
+							.padding()
+							.background(Color.green.opacity(0.8))
+							.cornerRadius(10)
+							.disabled(waypointManager.waypointNameInput.isEmpty)
+						}
+					}
+					.padding()
+					.background(Color.black.opacity(0.8))
+					.cornerRadius(15)
+					.frame(maxWidth: 300)
+				}
 			}
 		}
+	}
+	
+	private var dateFormatter: DateFormatter {
+		let formatter = DateFormatter()
+		formatter.dateStyle = .none
+		formatter.timeStyle = .short
+		return formatter
 	}
 }
 
@@ -972,12 +1260,14 @@ extension Notification.Name {
 	static let streamToggle = Notification.Name("streamToggle")
 	static let setTargetCenter = Notification.Name("setTargetCenter")
 	static let detectObject = Notification.Name("detectObject")
+	static let addWaypoint = Notification.Name("addWaypoint")
 }
 
 struct ARViewContainer: UIViewRepresentable {
 	let spatialAudioManager: SpatialAudioManager
 	let objectDetectionManager: ObjectDetectionManager
 	let speechManager: SpeechManager
+	let waypointManager: WaypointManager
 	
 	func makeUIView(context: Context) -> ARView {
 		let arView = ARView(frame: .zero)
@@ -1001,6 +1291,7 @@ struct ARViewContainer: UIViewRepresentable {
 		arView.session.delegate = context.coordinator
 		context.coordinator.setSpatialAudioManager(spatialAudioManager)
 		context.coordinator.setObjectDetectionManager(objectDetectionManager)
+		context.coordinator.setWaypointManager(waypointManager)
 		context.coordinator.setARView(arView)
 
 		NotificationCenter.default.addObserver(forName: .streamToggle, object: nil, queue: .main) { note in
@@ -1015,6 +1306,10 @@ struct ARViewContainer: UIViewRepresentable {
 		NotificationCenter.default.addObserver(forName: .detectObject, object: nil, queue: .main) { note in
 			guard let target = note.userInfo?["target"] as? String else { return }
 			context.coordinator.detectAndSetTarget(target: target, arView: arView)
+		}
+		
+		NotificationCenter.default.addObserver(forName: .addWaypoint, object: nil, queue: .main) { _ in
+			context.coordinator.addWaypointAtCenter(arView: arView)
 		}
 
 		return arView
@@ -1034,6 +1329,7 @@ struct ARViewContainer: UIViewRepresentable {
 		private let pointDownsample: Int = 3 // take every Nth vertex
 		private var spatialAudioManager: SpatialAudioManager?
 		private var objectDetectionManager: ObjectDetectionManager?
+		private var waypointManager: WaypointManager?
 		private var arView: ARView?
 
 		func setSpatialAudioManager(_ manager: SpatialAudioManager) {
@@ -1042,6 +1338,10 @@ struct ARViewContainer: UIViewRepresentable {
 		
 		func setObjectDetectionManager(_ manager: ObjectDetectionManager) {
 			objectDetectionManager = manager
+		}
+		
+		func setWaypointManager(_ manager: WaypointManager) {
+			waypointManager = manager
 		}
 		
 		func setARView(_ view: ARView) {
@@ -1076,6 +1376,37 @@ struct ARViewContainer: UIViewRepresentable {
 				spatialAudioManager?.setTarget(worldPosition: targetPosition)
 				
 				print("Target set at fallback position: \(targetPosition)")
+			}
+		}
+		
+		func addWaypointAtCenter(arView: ARView) {
+			guard let frame = arView.session.currentFrame else { return }
+			
+			// Get the center point of the screen
+			let screenCenter = CGPoint(x: arView.bounds.midX, y: arView.bounds.midY)
+			
+			// Perform hit test from the center of the screen
+			let hitTestResults = arView.hitTest(screenCenter, types: [.existingPlaneUsingExtent, .estimatedHorizontalPlane, .featurePoint])
+			
+			if let result = hitTestResults.first {
+				// Convert hit test result to world position
+				let worldTransform = result.worldTransform
+				let worldPosition = simd_float3(worldTransform.columns.3.x, worldTransform.columns.3.y, worldTransform.columns.3.z)
+				
+				// Start waypoint creation process
+				waypointManager?.startCreatingWaypoint(at: worldPosition)
+				
+				print("📍 Starting waypoint creation at world position: \(worldPosition)")
+			} else {
+				// Fallback: create waypoint 1 meter in front of the camera
+				let cameraTransform = frame.camera.transform
+				let cameraPosition = simd_float3(cameraTransform.columns.3.x, cameraTransform.columns.3.y, cameraTransform.columns.3.z)
+				let cameraForward = -simd_float3(cameraTransform.columns.2.x, cameraTransform.columns.2.y, cameraTransform.columns.2.z)
+				let waypointPosition = cameraPosition + cameraForward * 1.0
+				
+				waypointManager?.startCreatingWaypoint(at: waypointPosition)
+				
+				print("📍 Starting waypoint creation at fallback position: \(waypointPosition)")
 			}
 		}
 		
