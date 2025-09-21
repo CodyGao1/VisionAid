@@ -44,6 +44,7 @@ const char* websocket_path = "/video?role=broadcaster";
 
 WebSocketsClient webSocket;
 bool wsConnected = false;
+int framesSent = 0;
 
 void setupLedFlash();
 void webSocketEvent(WStype_t type, uint8_t * payload, size_t length);
@@ -133,9 +134,10 @@ void setup() {
     s->set_brightness(s, 1);   // up the brightness just a bit
     s->set_saturation(s, -2);  // lower the saturation
   }
-  // drop down frame size for higher initial frame rate
+  // drop down frame size for higher initial frame rate and smaller WebSocket packets
   if (config.pixel_format == PIXFORMAT_JPEG) {
-    s->set_framesize(s, FRAMESIZE_QVGA);
+    s->set_framesize(s, FRAMESIZE_QVGA);  // 320x240 for better WebSocket transmission
+    s->set_quality(s, 15);  // Lower quality for smaller file size (0-63, lower = better quality)
   }
 
 
@@ -186,15 +188,19 @@ void setup() {
 
 
 void loop() {
+  // Handle WebSocket events
   webSocket.loop();
   
   if (wsConnected) {
+    // Send video frame if connected
     sendVideoFrame();
-    delay(100); // Adjust frame rate (100ms = ~10 FPS)
+    delay(200); // Slower frame rate for WebSocket (200ms = ~5 FPS)
   } else {
-    // Try to reconnect if disconnected
-    delay(5000);
-    connectWebSocket();
+    // Wait a bit before checking again
+    delay(2000);
+    #ifdef DEBUG_MODE
+    Serial.println("[WS] Waiting for connection...");
+    #endif
   }
 }
 
@@ -203,33 +209,49 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
   switch(type) {
     case WStype_DISCONNECTED:
       #ifdef DEBUG_MODE
-      Serial.println("[WS] Disconnected");
+      Serial.println("[WS] Disconnected from server");
       #endif
       wsConnected = false;
       break;
       
     case WStype_CONNECTED:
       #ifdef DEBUG_MODE
-      Serial.printf("[WS] Connected to: %s\n", payload);
+      Serial.printf("[WS] Successfully connected to: %s\n", payload);
+      Serial.println("[WS] Ready to broadcast video!");
       #endif
       wsConnected = true;
       break;
       
     case WStype_TEXT:
       #ifdef DEBUG_MODE
-      Serial.printf("[WS] Received: %s\n", payload);
+      Serial.printf("[WS] Server message: %s\n", payload);
       #endif
-      // Handle server messages here if needed
+      // Handle server confirmation messages
       break;
       
     case WStype_ERROR:
       #ifdef DEBUG_MODE
-      Serial.println("[WS] Error occurred");
+      Serial.printf("[WS] Connection error occurred (code: %d)\n", type);
       #endif
       wsConnected = false;
       break;
+
+    case WStype_PING:
+      #ifdef DEBUG_MODE
+      Serial.println("[WS] Ping received");
+      #endif
+      break;
+
+    case WStype_PONG:
+      #ifdef DEBUG_MODE
+      Serial.println("[WS] Pong received");
+      #endif
+      break;
       
     default:
+      #ifdef DEBUG_MODE
+      Serial.printf("[WS] Unknown event type: %d\n", type);
+      #endif
       break;
   }
 }
@@ -237,12 +259,22 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
 // Connect to WebSocket server
 void connectWebSocket() {
   #ifdef DEBUG_MODE
-  Serial.println("[WS] Connecting to WebSocket server...");
+  Serial.println("[WS] Attempting to connect to WebSocket server...");
+  Serial.printf("[WS] Host: %s:%d\n", websocket_host, websocket_port);
+  Serial.printf("[WS] Path: %s\n", websocket_path);
   #endif
+  
+  // Initialize WebSocket connection
   webSocket.begin(websocket_host, websocket_port, websocket_path);
   webSocket.onEvent(webSocketEvent);
-  webSocket.setReconnectInterval(5000);
-  webSocket.enableHeartbeat(15000, 3000, 2);
+  
+  // Set connection parameters
+  webSocket.setReconnectInterval(5000);  // Try to reconnect every 5 seconds
+  webSocket.enableHeartbeat(15000, 3000, 2);  // Ping every 15s, timeout 3s, 2 tries
+  
+  #ifdef DEBUG_MODE
+  Serial.println("[WS] WebSocket client initialized");
+  #endif
 }
 
 // Capture and send video frame
@@ -250,16 +282,55 @@ void sendVideoFrame() {
   camera_fb_t * fb = esp_camera_fb_get();
   if (!fb) {
     #ifdef DEBUG_MODE
-    Serial.println("Camera capture failed");
+    Serial.println("[CAM] Frame capture failed!");
     #endif
+    return;
+  }
+  
+  #ifdef DEBUG_MODE
+  Serial.printf("[CAM] Captured frame: %d bytes, format: %d\n", fb->len, fb->format);
+  #endif
+  
+  // Check if frame is JPEG format
+  if (fb->format != PIXFORMAT_JPEG) {
+    #ifdef DEBUG_MODE
+    Serial.println("[CAM] Warning: Frame is not JPEG format!");
+    #endif
+    esp_camera_fb_return(fb);
+    return;
+  }
+  
+  // Check frame size (limit to reasonable size for WebSocket)
+  if (fb->len > 100000) { // 100KB limit
+    #ifdef DEBUG_MODE
+    Serial.printf("[CAM] Frame too large: %d bytes, skipping\n", fb->len);
+    #endif
+    esp_camera_fb_return(fb);
     return;
   }
   
   // Encode frame to base64
   String encoded = base64::encode(fb->buf, fb->len);
   
-  // Send directly to WebSocket (simplified for the VM server)
-  webSocket.sendTXT(encoded);
+  #ifdef DEBUG_MODE
+  Serial.printf("[CAM] Encoded to base64: %d chars\n", encoded.length());
+  #endif
+  
+  // Send to WebSocket
+  bool sent = webSocket.sendTXT(encoded);
+  
+  if (sent) {
+    framesSent++;
+    #ifdef DEBUG_MODE
+    if (framesSent % 10 == 0) {  // Log every 10th frame to avoid spam
+      Serial.printf("[WS] Frame #%d sent successfully\n", framesSent);
+    }
+    #endif
+  } else {
+    #ifdef DEBUG_MODE
+    Serial.println("[WS] Failed to send frame!");
+    #endif
+  }
   
   esp_camera_fb_return(fb);
 }
