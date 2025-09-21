@@ -45,6 +45,8 @@ const char* websocket_path = "/video?role=broadcaster";
 WebSocketsClient webSocket;
 bool wsConnected = false;
 int framesSent = 0;
+unsigned long lastConnectionAttempt = 0;
+bool connectionAttempted = false;
 
 void setupLedFlash();
 void webSocketEvent(WStype_t type, uint8_t * payload, size_t length);
@@ -178,11 +180,22 @@ void setup() {
   #endif
 
 
+  // Wait a bit for camera to stabilize
+  delay(2000);
+
   // Setup WebSocket connection
   connectWebSocket();
 
   #ifdef DEBUG_MODE
-  Serial.println("Camera Ready! Streaming to WebSocket server...");
+  Serial.println("Camera Ready! Attempting to stream to WebSocket server...");
+  Serial.println("===== ESP32-CAM WebSocket Broadcaster =====");
+  Serial.print("Target: ");
+  Serial.print(websocket_host);
+  Serial.print(":");
+  Serial.println(websocket_port);
+  Serial.print("Path: ");
+  Serial.println(websocket_path);
+  Serial.println("============================================");
   #endif
 }
 
@@ -196,11 +209,24 @@ void loop() {
     sendVideoFrame();
     delay(200); // Slower frame rate for WebSocket (200ms = ~5 FPS)
   } else {
-    // Wait a bit before checking again
-    delay(2000);
-    #ifdef DEBUG_MODE
-    Serial.println("[WS] Waiting for connection...");
-    #endif
+    // Check connection status every 5 seconds
+    unsigned long now = millis();
+    if (now - lastConnectionAttempt > 5000) {
+      lastConnectionAttempt = now;
+      
+      #ifdef DEBUG_MODE
+      if (!connectionAttempted) {
+        Serial.println("[WS] ⏳ Waiting for WebSocket connection...");
+        Serial.println("[WS] Check server logs and /video/status endpoint");
+        connectionAttempted = true;
+      } else {
+        Serial.println("[WS] ⏳ Still waiting for connection...");
+        Serial.printf("[WS] WiFi status: %s\n", WiFi.isConnected() ? "Connected" : "Disconnected");
+        Serial.printf("[WS] Free heap: %d bytes\n", ESP.getFreeHeap());
+      }
+      #endif
+    }
+    delay(1000);
   }
 }
 
@@ -227,6 +253,13 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
       Serial.printf("[WS] Server message: %s\n", payload);
       #endif
       // Handle server confirmation messages
+      // Check if this is the broadcaster confirmation
+      if (strstr((char*)payload, "broadcaster_connected")) {
+        #ifdef DEBUG_MODE
+        Serial.println("[WS] ✅ Broadcaster role confirmed by server!");
+        #endif
+        wsConnected = true;  // Ensure we're marked as connected
+      }
       break;
       
     case WStype_ERROR:
