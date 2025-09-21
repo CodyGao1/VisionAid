@@ -28,6 +28,9 @@ class SpatialAudioManager: ObservableObject {
 	private let headTracker = CMHeadphoneMotionManager()
 	private var isHeadTrackingActive = false
 	
+	// Ping scheduling control
+	private var currentPingTask: DispatchWorkItem?
+	
 	init() {
 		setupAudioEngine()
 		generatePingSounds()
@@ -57,6 +60,16 @@ class SpatialAudioManager: ObservableObject {
 		// Configure player node for spatial audio
 		playerNode.position = AVAudio3DPoint(x: 0, y: 0, z: -1)
 		playerNode.renderingAlgorithm = .HRTF
+		
+		// Enhanced spatial audio settings for more precise directionality
+		environmentNode.distanceAttenuationParameters.maximumDistance = 50.0
+		environmentNode.distanceAttenuationParameters.referenceDistance = 1.0
+		environmentNode.distanceAttenuationParameters.rolloffFactor = 2.0
+		
+		// More aggressive reverb settings for better spatial perception
+		environmentNode.reverbParameters.enable = true
+		environmentNode.reverbParameters.level = 0.1
+		environmentNode.reverbParameters.filterParameters.bypass = false
 		
 		isSetup = true
 	}
@@ -122,6 +135,10 @@ class SpatialAudioManager: ObservableObject {
 	}
 	
 	func setTarget(worldPosition: simd_float3) {
+		// Stop any existing pinging immediately
+		stopPinging()
+		
+		// Set new target and start pinging
 		targetWorldPosition = worldPosition
 		startPinging()
 	}
@@ -155,6 +172,7 @@ class SpatialAudioManager: ObservableObject {
 		// Update target audio position if we have a target
 		if let target = targetWorldPosition {
 			playerNode.position = AVAudio3DPoint(x: target.x, y: target.y, z: target.z)
+			updateSpatialAudioEnhancement(targetPosition: target, listenerPosition: currentCameraPosition)
 		}
 	}
 	
@@ -189,43 +207,61 @@ class SpatialAudioManager: ObservableObject {
 		)
 	}
 	
-	func updateTargetScreenPosition(cameraTransform: simd_float4x4, viewBounds: CGRect, intrinsics: simd_float3x3) {
+	private func updateSpatialAudioEnhancement(targetPosition: simd_float3, listenerPosition: simd_float3) {
+		let distance = simd_distance(listenerPosition, targetPosition)
+		
+		// Calculate direction vector from listener to target
+		let direction = targetPosition - listenerPosition
+		let normalizedDirection = simd_normalize(direction)
+		
+		// Enhance distance attenuation for more dramatic spatial effect
+		let enhancedDistance = max(0.1, distance)
+		environmentNode.distanceAttenuationParameters.referenceDistance = min(1.0, enhancedDistance * 0.5)
+		
+		// Adjust reverb based on distance for better depth perception
+		let reverbLevel = min(0.3, 0.05 + (distance * 0.02))
+		environmentNode.reverbParameters.level = Float(reverbLevel)
+		
+		// Calculate angle-based volume adjustment for more directional effect
+		// This makes sounds more directional when they're to the side
+		let volumeMultiplier = calculateDirectionalVolume(direction: normalizedDirection)
+		playerNode.volume = Float(volumeMultiplier)
+	}
+	
+	private func calculateDirectionalVolume(direction: simd_float3) -> Double {
+		// Get the angle from the forward direction (assuming forward is -Z)
+		let forward = simd_float3(0, 0, -1)
+		let dotProduct = simd_dot(direction, forward)
+		let angle = acos(max(-1.0, min(1.0, dotProduct)))
+		
+		// Create more dramatic volume differences based on angle
+		// Sounds directly in front: full volume
+		// Sounds to the side: reduced volume
+		// Sounds behind: very quiet
+		let normalizedAngle = angle / Float.pi // 0 to 1
+		
+		// Exponential curve for more dramatic directional effect
+		let volumeMultiplier = pow(cos(angle * 0.5), 2.0) // More aggressive than linear
+		
+		return max(0.1, min(1.0, Double(volumeMultiplier))) // Keep some minimum volume
+	}
+	
+	func updateTargetScreenPosition(frame: ARFrame, viewBounds: CGRect) {
 		guard let worldPos = targetWorldPosition else {
 			targetScreenPosition = nil
 			return
 		}
 		
-		// Transform world position to camera coordinate system
-		let cameraPos = simd_float4(worldPos.x, worldPos.y, worldPos.z, 1.0)
-		let cameraTransformInverse = cameraTransform.inverse
-		let localPos = cameraTransformInverse * cameraPos
+		// Use ARKit's built-in projection method
+		let camera = frame.camera
+		let screenPoint = camera.projectPoint(worldPos, 
+											  orientation: .portrait, 
+											  viewportSize: CGSize(width: viewBounds.width, height: viewBounds.height))
 		
-		// Check if point is in front of camera
-		if localPos.z > 0 {
-			targetScreenPosition = nil
-			return
-		}
-		
-		// Project to screen coordinates
-		let x = -localPos.x / -localPos.z
-		let y = -localPos.y / -localPos.z
-		
-		// Apply camera intrinsics
-		let fx = intrinsics.columns.0.x
-		let fy = intrinsics.columns.1.y
-		let cx = intrinsics.columns.2.x
-		let cy = intrinsics.columns.2.y
-		
-		let screenX = x * fx + cx
-		let screenY = y * fy + cy
-		
-		// Convert to view coordinates
-		let viewX = CGFloat(screenX / intrinsics.columns.2.x) * viewBounds.width
-		let viewY = CGFloat(screenY / intrinsics.columns.2.y) * viewBounds.height
-		
-		// Check if point is visible on screen
-		if viewX >= 0 && viewX <= viewBounds.width && viewY >= 0 && viewY <= viewBounds.height {
-			targetScreenPosition = CGPoint(x: viewX, y: viewY)
+		// Check if the point is within the screen bounds
+		if screenPoint.x >= 0 && screenPoint.x <= viewBounds.width && 
+		   screenPoint.y >= 0 && screenPoint.y <= viewBounds.height {
+			targetScreenPosition = CGPoint(x: CGFloat(screenPoint.x), y: CGFloat(screenPoint.y))
 		} else {
 			targetScreenPosition = nil
 		}
@@ -284,10 +320,17 @@ class SpatialAudioManager: ObservableObject {
 		let interval = calculatePingInterval()
 		
 		playerNode.scheduleBuffer(buffer, at: nil, options: [], completionHandler: { [weak self] in
-			// Schedule next ping after distance-based delay
-			DispatchQueue.main.asyncAfter(deadline: .now() + interval) {
+			// Create a new task for the next ping
+			let nextPingTask = DispatchWorkItem { [weak self] in
 				self?.schedulePing()
 			}
+			
+			// Cancel any existing task and store the new one
+			self?.currentPingTask?.cancel()
+			self?.currentPingTask = nextPingTask
+			
+			// Schedule the next ping
+			DispatchQueue.main.asyncAfter(deadline: .now() + interval, execute: nextPingTask)
 		})
 		
 		if !playerNode.isPlaying {
@@ -297,8 +340,19 @@ class SpatialAudioManager: ObservableObject {
 	
 	func stopPinging() {
 		isPlayingPing = false
+		
+		// Cancel any scheduled ping tasks
+		currentPingTask?.cancel()
+		currentPingTask = nil
+		
+		// Stop the player node and clear any scheduled buffers
 		playerNode.stop()
-		audioEngine.stop()
+		playerNode.reset()
+		
+		// Stop the audio engine if it's running
+		if audioEngine.isRunning {
+			audioEngine.stop()
+		}
 	}
 	
 	func stopHeadTracking() {
@@ -541,9 +595,8 @@ struct ARViewContainer: UIViewRepresentable {
 			// Update target screen position if we have an AR view
 			if let arView = arView {
 				spatialAudioManager?.updateTargetScreenPosition(
-					cameraTransform: frame.camera.transform,
-					viewBounds: arView.bounds,
-					intrinsics: frame.camera.intrinsics
+					frame: frame,
+					viewBounds: arView.bounds
 				)
 			}
 		}
