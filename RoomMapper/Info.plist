@@ -33,6 +33,8 @@
 	<string>We need camera access to map your room using AR.</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>This app discovers and connects to a local WebSocket server to stream mesh.</string>
+	<key>NSMotionUsageDescription</key>
+	<string></string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>
