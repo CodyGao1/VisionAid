@@ -740,29 +740,60 @@ class ObjectDetectionManager: ObservableObject {
 	}
 	
 	private func calculateCenterPoint(from bbox: BoundingBox, imageSize: CGSize) -> (center: CGPoint, boundingBox: CGRect) {
-		// bbox.box_2d format: [y_min, x_min, y_max, x_max] (normalized to 1000)
-		let yMinNorm = CGFloat(bbox.box_2d[0]) / 1000.0
-		let xMinNorm = CGFloat(bbox.box_2d[1]) / 1000.0 
-		let yMaxNorm = CGFloat(bbox.box_2d[2]) / 1000.0
-		let xMaxNorm = CGFloat(bbox.box_2d[3]) / 1000.0
+		// bbox.box_2d format: [y_min, x_min, y_max, x_max]
+		// Robust unit handling: supports pixel, 0-1000, or 0-1 normalized inputs
+		let yMinRaw = CGFloat(bbox.box_2d[0])
+		let xMinRaw = CGFloat(bbox.box_2d[1])
+		let yMaxRaw = CGFloat(bbox.box_2d[2])
+		let xMaxRaw = CGFloat(bbox.box_2d[3])
 		
-		// Calculate center in normalized coordinates (0-1)
-		let centerXNorm = (xMinNorm + xMaxNorm) / 2
-		let centerYNorm = (yMinNorm + yMaxNorm) / 2
+		let maxRaw = max(yMinRaw, xMinRaw, yMaxRaw, xMaxRaw)
 		
-		// Convert to actual image pixel coordinates
-		let centerX = centerXNorm * imageSize.width
-		let centerY = centerYNorm * imageSize.height
+		// Determine scale
+		let xMinPx: CGFloat
+		let yMinPx: CGFloat
+		let xMaxPx: CGFloat
+		let yMaxPx: CGFloat
 		
-		// Create bounding box in image coordinates
+		if maxRaw <= 1.001 {
+			// Already 0-1 normalized
+			xMinPx = xMinRaw * imageSize.width
+			yMinPx = yMinRaw * imageSize.height
+			xMaxPx = xMaxRaw * imageSize.width
+			yMaxPx = yMaxRaw * imageSize.height
+		} else if maxRaw <= 1000.0 {
+			// 0-1000 normalized
+			xMinPx = (xMinRaw / 1000.0) * imageSize.width
+			yMinPx = (yMinRaw / 1000.0) * imageSize.height
+			xMaxPx = (xMaxRaw / 1000.0) * imageSize.width
+			yMaxPx = (yMaxRaw / 1000.0) * imageSize.height
+		} else {
+			// Pixel coordinates
+			xMinPx = xMinRaw
+			yMinPx = yMinRaw
+			xMaxPx = xMaxRaw
+			yMaxPx = yMaxRaw
+		}
+		
+		// Clamp to image bounds
+		let clampedXMin = max(0, min(imageSize.width, xMinPx))
+		let clampedYMin = max(0, min(imageSize.height, yMinPx))
+		let clampedXMax = max(0, min(imageSize.width, xMaxPx))
+		let clampedYMax = max(0, min(imageSize.height, yMaxPx))
+		
+		let centerX = (clampedXMin + clampedXMax) / 2.0
+		let centerY = (clampedYMin + clampedYMax) / 2.0
+		
 		let boundingBox = CGRect(
-			x: xMinNorm * imageSize.width,
-			y: yMinNorm * imageSize.height,
-			width: (xMaxNorm - xMinNorm) * imageSize.width,
-			height: (yMaxNorm - yMinNorm) * imageSize.height
+			x: min(clampedXMin, clampedXMax),
+			y: min(clampedYMin, clampedYMax),
+			width: abs(clampedXMax - clampedXMin),
+			height: abs(clampedYMax - clampedYMin)
 		)
 		
-		print("📍 Normalized center: (\(centerXNorm), \(centerYNorm))")
+		let normCenterX = centerX / imageSize.width
+		let normCenterY = centerY / imageSize.height
+		print("📍 Normalized center: (\(normCenterX), \(normCenterY))")
 		print("📍 Pixel center: (\(centerX), \(centerY)) in image size: \(imageSize)")
 		print("📦 Bounding box: \(boundingBox)")
 		
@@ -1039,7 +1070,7 @@ struct ContentView: View {
 											spatialAudioManager.setTarget(worldPosition: waypoint.worldPosition)
 										} else {
 											// Fall back to object detection
-											NotificationCenter.default.post(name: .detectObject, object: nil, userInfo: ["target": speechManager.recognizedText])
+										NotificationCenter.default.post(name: .detectObject, object: nil, userInfo: ["target": speechManager.recognizedText, "boxOnly": true])
 										}
 									}
 								} else {
@@ -1331,7 +1362,8 @@ struct ARViewContainer: UIViewRepresentable {
 		
 		NotificationCenter.default.addObserver(forName: .detectObject, object: nil, queue: .main) { note in
 			guard let target = note.userInfo?["target"] as? String else { return }
-			context.coordinator.detectAndSetTarget(target: target, arView: arView)
+			let boxOnly = note.userInfo?["boxOnly"] as? Bool ?? false
+			context.coordinator.detectAndSetTarget(target: target, arView: arView, boxOnly: boxOnly)
 		}
 		
 		NotificationCenter.default.addObserver(forName: .addWaypoint, object: nil, queue: .main) { _ in
@@ -1435,7 +1467,7 @@ struct ARViewContainer: UIViewRepresentable {
 			}
 		}
 		
-		func detectAndSetTarget(target: String, arView: ARView) {
+		func detectAndSetTarget(target: String, arView: ARView, boxOnly: Bool = false) {
 			guard let frame = arView.session.currentFrame,
 				  let detectionManager = objectDetectionManager else { return }
 			
@@ -1454,128 +1486,65 @@ struct ARViewContainer: UIViewRepresentable {
 				
 				print("🎯 Object detected at image point: \(imagePoint)")
 				
-				// Convert image coordinates to ARView screen coordinates using frame data
-				let screenPoint = self.convertImagePointToScreenPoint(imagePoint, capturedImage: frameData.capturedImage, arView: arView)
+				// Convert image coordinates to ARView screen coordinates using ARKit displayTransform
+				let imageSize = CVImageBufferGetDisplaySize(frameData.capturedImage)
+				let screenPoint = self.convertImagePointToScreenPoint(imagePoint, imageSize: imageSize, arView: arView)
 				print("📱 Converted to screen point: \(screenPoint)")
 				
 				// Convert bounding box to screen coordinates if available
 				var screenBoundingBox: CGRect? = nil
 				if let imageBBox = imageBoundingBox {
-					screenBoundingBox = self.convertImageRectToScreenRect(imageBBox, capturedImage: frameData.capturedImage, arView: arView)
+					screenBoundingBox = self.convertImageRectToScreenRect(imageBBox, imageSize: imageSize, arView: arView)
 				}
 				
-				// Show visual indicators where object was detected
-				self.spatialAudioManager?.setDetectedObjectScreenPosition(screenPoint)
-				self.spatialAudioManager?.setDetectedBoundingBox(screenBoundingBox)
-				
-				// Convert screen point to world position using LiDAR/depth
-				self.setTargetFromScreenPoint(screenPoint, arView: arView, camera: frameData.camera, sceneDepth: frameData.sceneDepth)
+				if boxOnly {
+					// Box-only mode: draw only the bounding box, no center point or spatial target
+					self.spatialAudioManager?.setDetectedBoundingBox(screenBoundingBox)
+					self.spatialAudioManager?.setDetectedObjectScreenPosition(nil)
+					print("🟦 Box-only mode: drew bounding box without center point/target")
+				} else {
+					// Show visual indicators where object was detected
+					self.spatialAudioManager?.setDetectedObjectScreenPosition(screenPoint)
+					self.spatialAudioManager?.setDetectedBoundingBox(screenBoundingBox)
+					
+					// Convert screen point to world position using LiDAR/depth
+					self.setTargetFromScreenPoint(screenPoint, arView: arView, camera: frameData.camera, sceneDepth: frameData.sceneDepth)
+				}
 			}
 		}
 		
-		private func convertImagePointToScreenPoint(_ imagePoint: CGPoint, capturedImage: CVPixelBuffer, arView: ARView) -> CGPoint {
-			// Get the camera image size
-			let imageSize = CVImageBufferGetDisplaySize(capturedImage)
+		private func convertImagePointToScreenPoint(_ imagePoint: CGPoint, imageSize: CGSize, arView: ARView) -> CGPoint {
 			let viewSize = arView.bounds.size
+			guard let frame = arView.session.currentFrame else { return .zero }
+			let interfaceOrientation: UIInterfaceOrientation = (UIApplication.shared.connectedScenes.first as? UIWindowScene)?.interfaceOrientation ?? .portrait
 			
-			// Calculate aspect ratios
-			let imageAspect = imageSize.width / imageSize.height
-			let viewAspect = viewSize.width / viewSize.height
-			
-			var screenPoint: CGPoint
-			
-			if imageAspect > viewAspect {
-				// Image is wider than view - fit height, crop width
-				let scaledHeight = viewSize.height
-				let scaledWidth = scaledHeight * imageAspect
-				let xOffset = (scaledWidth - viewSize.width) / 2
-				
-				let normalizedX = imagePoint.x / imageSize.width
-				let normalizedY = imagePoint.y / imageSize.height
-				
-				screenPoint = CGPoint(
-					x: normalizedX * scaledWidth - xOffset,
-					y: normalizedY * scaledHeight
-				)
-			} else {
-				// Image is taller than view - fit width, crop height
-				let scaledWidth = viewSize.width
-				let scaledHeight = scaledWidth / imageAspect
-				let yOffset = (scaledHeight - viewSize.height) / 2
-				
-				let normalizedX = imagePoint.x / imageSize.width
-				let normalizedY = imagePoint.y / imageSize.height
-				
-				screenPoint = CGPoint(
-					x: normalizedX * scaledWidth,
-					y: normalizedY * scaledHeight - yOffset
-				)
-			}
-			
-			// Clamp to view bounds
-			screenPoint.x = max(0, min(viewSize.width, screenPoint.x))
-			screenPoint.y = max(0, min(viewSize.height, screenPoint.y))
-			
-			print("📐 Image size: \(imageSize), View size: \(viewSize)")
-			print("📐 Image aspect: \(imageAspect), View aspect: \(viewAspect)")
-			print("📐 Final screen point: \(screenPoint)")
-			
-			return screenPoint
+			var normalized = CGPoint(x: imagePoint.x / imageSize.width, y: imagePoint.y / imageSize.height)
+			let transform = frame.displayTransform(for: interfaceOrientation, viewportSize: viewSize)
+			let mapped = normalized.applying(transform)
+			let screenPoint = CGPoint(x: mapped.x * viewSize.width, y: mapped.y * viewSize.height)
+			return CGPoint(x: max(0, min(viewSize.width, screenPoint.x)), y: max(0, min(viewSize.height, screenPoint.y)))
 		}
 		
-		private func convertImageRectToScreenRect(_ imageRect: CGRect, capturedImage: CVPixelBuffer, arView: ARView) -> CGRect {
-			// Get the camera image size
-			let imageSize = CVImageBufferGetDisplaySize(capturedImage)
+		private func convertImageRectToScreenRect(_ imageRect: CGRect, imageSize: CGSize, arView: ARView) -> CGRect {
 			let viewSize = arView.bounds.size
+			guard let frame = arView.session.currentFrame else { return .zero }
+			let interfaceOrientation: UIInterfaceOrientation = (UIApplication.shared.connectedScenes.first as? UIWindowScene)?.interfaceOrientation ?? .portrait
+			let transform = frame.displayTransform(for: interfaceOrientation, viewportSize: viewSize)
 			
-			// Calculate aspect ratios
-			let imageAspect = imageSize.width / imageSize.height
-			let viewAspect = viewSize.width / viewSize.height
+			let topLeft = CGPoint(x: imageRect.minX / imageSize.width, y: imageRect.minY / imageSize.height).applying(transform)
+			let topRight = CGPoint(x: imageRect.maxX / imageSize.width, y: imageRect.minY / imageSize.height).applying(transform)
+			let bottomLeft = CGPoint(x: imageRect.minX / imageSize.width, y: imageRect.maxY / imageSize.height).applying(transform)
+			let bottomRight = CGPoint(x: imageRect.maxX / imageSize.width, y: imageRect.maxY / imageSize.height).applying(transform)
 			
-			var screenRect: CGRect
+			let xs = [topLeft.x, topRight.x, bottomLeft.x, bottomRight.x].map { $0 * viewSize.width }
+			let ys = [topLeft.y, topRight.y, bottomLeft.y, bottomRight.y].map { $0 * viewSize.height }
 			
-			if imageAspect > viewAspect {
-				// Image is wider than view - fit height, crop width
-				let scaledHeight = viewSize.height
-				let scaledWidth = scaledHeight * imageAspect
-				let xOffset = (scaledWidth - viewSize.width) / 2
-				
-				let normalizedX = imageRect.origin.x / imageSize.width
-				let normalizedY = imageRect.origin.y / imageSize.height
-				let normalizedWidth = imageRect.width / imageSize.width
-				let normalizedHeight = imageRect.height / imageSize.height
-				
-				screenRect = CGRect(
-					x: normalizedX * scaledWidth - xOffset,
-					y: normalizedY * scaledHeight,
-					width: normalizedWidth * scaledWidth,
-					height: normalizedHeight * scaledHeight
-				)
-			} else {
-				// Image is taller than view - fit width, crop height
-				let scaledWidth = viewSize.width
-				let scaledHeight = scaledWidth / imageAspect
-				let yOffset = (scaledHeight - viewSize.height) / 2
-				
-				let normalizedX = imageRect.origin.x / imageSize.width
-				let normalizedY = imageRect.origin.y / imageSize.height
-				let normalizedWidth = imageRect.width / imageSize.width
-				let normalizedHeight = imageRect.height / imageSize.height
-				
-				screenRect = CGRect(
-					x: normalizedX * scaledWidth,
-					y: normalizedY * scaledHeight - yOffset,
-					width: normalizedWidth * scaledWidth,
-					height: normalizedHeight * scaledHeight
-				)
-			}
+			let minX = max(0, min(xs.min() ?? 0, viewSize.width))
+			let maxX = min(viewSize.width, max(xs.max() ?? 0, 0))
+			let minY = max(0, min(ys.min() ?? 0, viewSize.height))
+			let maxY = min(viewSize.height, max(ys.max() ?? 0, 0))
 			
-			// Clamp to view bounds
-			let clampedRect = screenRect.intersection(CGRect(origin: .zero, size: viewSize))
-			
-			print("📐 Image rect: \(imageRect), Screen rect: \(clampedRect)")
-			
-			return clampedRect
+			return CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
 		}
 		
 		private func setTargetFromScreenPoint(_ screenPoint: CGPoint, arView: ARView, camera: ARCamera, sceneDepth: ARDepthData?) {
