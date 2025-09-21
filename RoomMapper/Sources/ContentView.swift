@@ -1588,13 +1588,40 @@ struct ContentView: View {
 									speechManager.stopListening()
 									// Process the recognized text
 									if !speechManager.recognizedText.isEmpty {
-										// Check if it's a waypoint navigation command first
-										if let waypoint = waypointManager.findWaypoint(byName: speechManager.recognizedText) {
+										let recognizedText = speechManager.recognizedText.lowercased()
+
+										// Check for proximity mode commands first
+										if recognizedText.contains("proximity") {
+											if recognizedText.contains("off") || recognizedText.contains("stop") || recognizedText.contains("disable") {
+												// Force proximity mode OFF
+												if proximityManager.isEnabled {
+													proximityManager.toggle()
+												}
+											} else if recognizedText.contains("on") || recognizedText.contains("start") || recognizedText.contains("enable") {
+												// Force proximity mode ON
+												if !proximityManager.isEnabled {
+													proximityManager.toggle()
+												}
+											} else {
+												// Just "proximity" - toggle current state
+												proximityManager.toggle()
+											}
+										}
+										// Check for waypoint creation commands
+										else if recognizedText.contains("add waypoint") {
+											let waypointName = extractWaypointName(from: speechManager.recognizedText)
+											if !waypointName.isEmpty {
+												// Create waypoint with voice command
+												NotificationCenter.default.post(name: .addWaypointVoice, object: nil, userInfo: ["name": waypointName])
+											}
+										}
+										// Check if it's a waypoint navigation command
+										else if let waypoint = waypointManager.findWaypoint(byName: speechManager.recognizedText) {
 											waypointManager.setActiveWaypoint(waypoint)
 											spatialAudioManager.setTarget(worldPosition: waypoint.worldPosition)
 										} else {
 											// Fall back to object detection
-										NotificationCenter.default.post(name: .detectObject, object: nil, userInfo: ["target": speechManager.recognizedText, "boxOnly": true])
+											NotificationCenter.default.post(name: .detectObject, object: nil, userInfo: ["target": speechManager.recognizedText, "boxOnly": true])
 										}
 									}
 								} else {
@@ -1945,7 +1972,7 @@ struct ContentView: View {
 		if proximityManager.isEnabled {
 			let now = CACurrentMediaTime()
 			let timeSinceLastReset = now - (proximityManager.lastResetTime > 0 ? proximityManager.lastResetTime : now)
-			
+
 			if timeSinceLastReset < 5.0 {
 				return ("●", Color.green) // Recently reset - healthy
 			} else if timeSinceLastReset < 25.0 {
@@ -1957,12 +1984,38 @@ struct ContentView: View {
 			return ("○", Color.gray) // Disabled
 		}
 	}
+
+	private func extractWaypointName(from text: String) -> String {
+		let lowercasedText = text.lowercased()
+
+		// Remove common prefixes
+		var cleanedText = lowercasedText
+			.replacingOccurrences(of: "add a waypoint called", with: "")
+			.replacingOccurrences(of: "add a waypoint", with: "")
+			.replacingOccurrences(of: "add waypoint called", with: "")
+			.replacingOccurrences(of: "add waypoint", with: "")
+			.replacingOccurrences(of: "create a waypoint called", with: "")
+			.replacingOccurrences(of: "create a waypoint", with: "")
+			.replacingOccurrences(of: "create waypoint called", with: "")
+			.replacingOccurrences(of: "create waypoint", with: "")
+			.trimmingCharacters(in: .whitespacesAndNewlines)
+
+		// Remove articles and common words that might not be part of the name
+		let wordsToRemove = ["the", "a", "an"]
+		let words = cleanedText.components(separatedBy: .whitespaces)
+		let filteredWords = words.filter { !wordsToRemove.contains($0) }
+		cleanedText = filteredWords.joined(separator: " ")
+
+		// Capitalize first letter of each word for proper naming
+		return cleanedText.capitalized
+	}
 }
 
 extension Notification.Name {
 	static let setTargetCenter = Notification.Name("setTargetCenter")
 	static let detectObject = Notification.Name("detectObject")
 	static let addWaypoint = Notification.Name("addWaypoint")
+	static let addWaypointVoice = Notification.Name("addWaypointVoice")
 }
 
 struct ARViewContainer: UIViewRepresentable {
@@ -2011,6 +2064,11 @@ struct ARViewContainer: UIViewRepresentable {
 		
 		NotificationCenter.default.addObserver(forName: .addWaypoint, object: nil, queue: .main) { _ in
 			context.coordinator.addWaypointAtCenter(arView: arView)
+		}
+
+		NotificationCenter.default.addObserver(forName: .addWaypointVoice, object: nil, queue: .main) { note in
+			guard let waypointName = note.userInfo?["name"] as? String else { return }
+			context.coordinator.addWaypointWithVoice(arView: arView, name: waypointName)
 		}
 
 		return arView
@@ -2086,21 +2144,21 @@ struct ARViewContainer: UIViewRepresentable {
 		
 		func addWaypointAtCenter(arView: ARView) {
 			guard let frame = arView.session.currentFrame else { return }
-			
+
 			// Get the center point of the screen
 			let screenCenter = CGPoint(x: arView.bounds.midX, y: arView.bounds.midY)
-			
+
 			// Perform hit test from the center of the screen
 			let hitTestResults = arView.hitTest(screenCenter, types: [.existingPlaneUsingExtent, .estimatedHorizontalPlane, .featurePoint])
-			
+
 			if let result = hitTestResults.first {
 				// Convert hit test result to world position
 				let worldTransform = result.worldTransform
 				let worldPosition = simd_float3(worldTransform.columns.3.x, worldTransform.columns.3.y, worldTransform.columns.3.z)
-				
+
 				// Start waypoint creation process
 				waypointManager?.startCreatingWaypoint(at: worldPosition)
-				
+
 				print("📍 Starting waypoint creation at world position: \(worldPosition)")
 			} else {
 				// Fallback: create waypoint 1 meter in front of the camera
@@ -2108,10 +2166,42 @@ struct ARViewContainer: UIViewRepresentable {
 				let cameraPosition = simd_float3(cameraTransform.columns.3.x, cameraTransform.columns.3.y, cameraTransform.columns.3.z)
 				let cameraForward = -simd_float3(cameraTransform.columns.2.x, cameraTransform.columns.2.y, cameraTransform.columns.2.z)
 				let waypointPosition = cameraPosition + cameraForward * 1.0
-				
+
 				waypointManager?.startCreatingWaypoint(at: waypointPosition)
-				
+
 				print("📍 Starting waypoint creation at fallback position: \(waypointPosition)")
+			}
+		}
+
+		func addWaypointWithVoice(arView: ARView, name: String) {
+			guard let frame = arView.session.currentFrame else { return }
+
+			// Get the center point of the screen (where camera is looking)
+			let screenCenter = CGPoint(x: arView.bounds.midX, y: arView.bounds.midY)
+
+			// Perform hit test from the center of the screen
+			let hitTestResults = arView.hitTest(screenCenter, types: [.existingPlaneUsingExtent, .estimatedHorizontalPlane, .featurePoint])
+
+			if let result = hitTestResults.first {
+				// Convert hit test result to world position
+				let worldTransform = result.worldTransform
+				let worldPosition = simd_float3(worldTransform.columns.3.x, worldTransform.columns.3.y, worldTransform.columns.3.z)
+
+				// Create waypoint directly with voice command
+				waypointManager?.createWaypoint(at: worldPosition, name: name)
+
+				print("🎤 Created waypoint '\(name)' at world position: \(worldPosition)")
+			} else {
+				// Fallback: create waypoint 1 meter in front of the camera
+				let cameraTransform = frame.camera.transform
+				let cameraPosition = simd_float3(cameraTransform.columns.3.x, cameraTransform.columns.3.y, cameraTransform.columns.3.z)
+				let cameraForward = -simd_float3(cameraTransform.columns.2.x, cameraTransform.columns.2.y, cameraTransform.columns.2.z)
+				let waypointPosition = cameraPosition + cameraForward * 1.0
+
+				// Create waypoint directly with voice command
+				waypointManager?.createWaypoint(at: waypointPosition, name: name)
+
+				print("🎤 Created waypoint '\(name)' at fallback position: \(waypointPosition)")
 			}
 		}
 		
