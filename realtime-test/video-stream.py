@@ -22,7 +22,7 @@ BACKEND_SERVER_URL = "ws://35.238.205.88:8081/video?role=broadcaster"
 # Video settings
 FRAME_WIDTH = 640
 FRAME_HEIGHT = 480
-FPS = 30
+FPS = 5  # Reduced for debugging
 JPEG_QUALITY = 80
 
 class VideoStreamClient:
@@ -30,7 +30,7 @@ class VideoStreamClient:
         self.websocket: Optional[websockets.WebSocketClientProtocol] = None
         self.camera: Optional[cv2.VideoCapture] = None
         self.is_streaming = False
-        self.frame_queue = queue.Queue(maxsize=10)  # Limit queue size to prevent memory issues
+        self.frame_queue = queue.Queue(maxsize=2)  # Smaller queue for debugging
         self.running = True
         
         print("📹 Starting Video Stream to KellerAI Backend...")
@@ -71,12 +71,16 @@ class VideoStreamClient:
         """Capture video frames in a separate thread."""
         print("🎬 Starting frame capture thread...")
         frame_interval = 1.0 / FPS
+        frame_count = 0
         
         while self.running and self.camera is not None:
             if self.is_streaming:
                 try:
                     ret, frame = self.camera.read()
+                    frame_count += 1
                     if ret:
+                        if frame_count % 10 == 0:  # Only print every 10th frame
+                            print(f"📸 Captured frame {frame_count}: {frame.shape}")
                         # Encode frame as JPEG
                         encode_param = [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY]
                         _, buffer = cv2.imencode('.jpg', frame, encode_param)
@@ -94,9 +98,15 @@ class VideoStreamClient:
                                 "width": frame.shape[1],
                                 "height": frame.shape[0]
                             })
+                            if frame_count % 10 == 0:  # Only print every 10th frame
+                                print(f"🎯 Frame {frame_count} queued (queue size: {self.frame_queue.qsize()})")
                         except queue.Full:
                             # Drop frame if queue is full (prevents memory buildup)
+                            if frame_count % 10 == 0:  # Only print every 10th frame
+                                print(f"⚠️ Frame {frame_count} - Queue full, dropping frame")
                             pass
+                    else:
+                        print("❌ Failed to capture frame from camera")  # Debug info
                             
                     time.sleep(frame_interval)
                     
@@ -148,20 +158,30 @@ class VideoStreamClient:
     
     async def send_frames(self):
         """Send video frames to WebSocket server."""
-        print("📤 Starting frame transmission...")
+        print("📤 SEND_FRAMES FUNCTION CALLED - Starting frame transmission...")
         
         while self.running and self.websocket:
             if self.is_streaming:
+                print("🔄 In streaming loop, trying to get frame from queue...")
                 try:
                     # Get frame from queue (blocking with timeout)
                     frame_data = self.frame_queue.get(timeout=0.1)
                     
-                    # Send frame to server
-                    await self.websocket.send(json.dumps(frame_data))
+                    print(f"📤 Sending frame...")  # Debug info
+                    # Send frame to server with timeout
+                    await asyncio.wait_for(
+                        self.websocket.send(json.dumps(frame_data)), 
+                        timeout=1.0
+                    )
+                    print(f"✅ Frame sent successfully")  # Debug info
                     
                 except queue.Empty:
                     # No frame available, continue
+                    print("⏳ No frames in queue, waiting...")  # Debug info
                     pass
+                except asyncio.TimeoutError:
+                    print("⏰ WebSocket send timeout - connection may be slow")
+                    await asyncio.sleep(0.1)
                 except websockets.exceptions.ConnectionClosed:
                     print("🔌 WebSocket connection closed during transmission")
                     break
@@ -187,7 +207,9 @@ class VideoStreamClient:
         self.is_streaming = True
         
         # Start sending frames
-        asyncio.create_task(self.send_frames())
+        print("🚀 Creating send_frames task...")
+        task = asyncio.create_task(self.send_frames())
+        print(f"✅ Task created: {task}")
     
     def stop_streaming(self):
         """Stop video streaming."""
@@ -234,31 +256,18 @@ class VideoStreamClient:
             self.cleanup()
             return
         
-        # Command loop
+        # Auto-start streaming for testing
+        print("🚀 AUTO-STARTING STREAMING FOR TESTING...")
+        await self.start_streaming()
+        
+        # Simple loop to keep running
         try:
+            print("📺 Streaming started! Press Ctrl+C to stop...")
             while self.running:
-                try:
-                    command = input().strip().lower()
-                    
-                    if command == 'q':
-                        print("👋 Exiting...")
-                        break
-                    elif command == '':
-                        if self.is_streaming:
-                            self.stop_streaming()
-                        else:
-                            await self.start_streaming()
-                    else:
-                        print("📝 Commands:")
-                        print("   ENTER - Start/stop streaming")
-                        print("   q - Quit")
+                await asyncio.sleep(1)  # Give time for other tasks
                 
-                except KeyboardInterrupt:
-                    print("\n👋 Interrupted, exiting...")
-                    break
-                except EOFError:
-                    print("\n👋 Input closed, exiting...")
-                    break
+        except KeyboardInterrupt:
+            print("\n👋 Interrupted, exiting...")
         
         finally:
             self.stop_streaming()
