@@ -569,7 +569,7 @@ class ObjectDetectionManager: ObservableObject {
 						completion(nil, nil)
 					}
 				} catch {
-					self?.lastDetectionResult = "Failed to parse response"
+					self?.lastDetectionResult = "I did not find anything in the image"
 					completion(nil, nil)
 				}
 			}
