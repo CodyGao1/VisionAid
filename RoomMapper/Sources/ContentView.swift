@@ -1501,7 +1501,9 @@ struct ARViewContainer: UIViewRepresentable {
 					// Box-only mode: draw only the bounding box, no center point or spatial target
 					self.spatialAudioManager?.setDetectedBoundingBox(screenBoundingBox)
 					self.spatialAudioManager?.setDetectedObjectScreenPosition(nil)
-					print("🟦 Box-only mode: drew bounding box without center point/target")
+					// Also place the waypoint (green target) at the center of the box
+					self.setTargetFromScreenPoint(screenPoint, arView: arView, camera: frameData.camera, sceneDepth: frameData.sceneDepth)
+					print("🟦 Box-only mode: drew bounding box and placed waypoint at center")
 				} else {
 					// Show visual indicators where object was detected
 					self.spatialAudioManager?.setDetectedObjectScreenPosition(screenPoint)
