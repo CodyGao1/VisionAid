@@ -1613,6 +1613,7 @@ struct ContentView: View {
 											if !waypointName.isEmpty {
 												// Create waypoint with voice command
 												NotificationCenter.default.post(name: .addWaypointVoice, object: nil, userInfo: ["name": waypointName])
+												return // Don't fall through to object detection
 											}
 										}
 										// Check if it's a waypoint navigation command
