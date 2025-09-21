@@ -1,9 +1,3 @@
-#!/usr/bin/env python3
-"""
-KellerAI Realtime Voice Chat - Backend Client
-Connects to your secure backend server for voice chat with OpenAI.
-"""
-
 import asyncio
 import websockets
 import pyaudio
