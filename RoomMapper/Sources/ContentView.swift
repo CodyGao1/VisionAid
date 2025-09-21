@@ -6,6 +6,245 @@ import simd
 import CoreMotion
 import Speech
 import Foundation
+import UIKit
+
+// MARK: - Proximity Detection with Haptic Feedback
+class ProximityDetectionManager: ObservableObject {
+	private let lightHaptic = UIImpactFeedbackGenerator(style: .light)
+	private let mediumHaptic = UIImpactFeedbackGenerator(style: .medium)
+	private let heavyHaptic = UIImpactFeedbackGenerator(style: .heavy)
+	private let rigidHaptic = UIImpactFeedbackGenerator(style: .rigid)
+	
+	@Published var isEnabled = false
+	@Published var currentDistance: Float = 10.0
+	@Published var isProximityActive = false
+	
+	// Detection parameters
+	private let maxDetectionDistance: Float = 3.0 // meters
+	private let minDetectionDistance: Float = 0.2 // meters
+	private let veryCloseDistance: Float = 0.5 // meters - trigger heavy feedback
+	private let closeDistance: Float = 1.0 // meters - trigger medium feedback
+	private let mediumDistance: Float = 2.0 // meters - trigger light feedback
+	
+	// Timing control
+	private var lastHapticTime: TimeInterval = 0
+	private var currentHapticInterval: TimeInterval = 1.0
+	private let maxHapticInterval: TimeInterval = 1.2 // slow when far
+	private let minHapticInterval: TimeInterval = 0.1 // very fast when close
+	
+	// Ray sampling for detection
+	private let rayCount = 5 // Number of rays to cast in front
+	private let raySpread: Float = 0.3 // Radians spread of detection cone
+	
+	init() {
+		// Prepare haptic generators for better responsiveness
+		lightHaptic.prepare()
+		mediumHaptic.prepare()
+		heavyHaptic.prepare()
+		rigidHaptic.prepare()
+	}
+	
+	func toggle() {
+		isEnabled.toggle()
+		if !isEnabled {
+			isProximityActive = false
+			currentDistance = maxDetectionDistance
+		}
+		print("📳 Proximity detection \(isEnabled ? "enabled" : "disabled")")
+	}
+	
+	func updateProximity(frame: ARFrame, arView: ARView) {
+		guard isEnabled else { return }
+		
+		let nearestDistance = detectNearestObstacle(frame: frame, arView: arView)
+		
+		DispatchQueue.main.async { [weak self] in
+			self?.currentDistance = nearestDistance
+			self?.updateHapticFeedback(distance: nearestDistance)
+		}
+	}
+	
+	private func detectNearestObstacle(frame: ARFrame, arView: ARView) -> Float {
+		var minDistance: Float = maxDetectionDistance
+		
+		let cameraTransform = frame.camera.transform
+		let cameraPosition = simd_float3(cameraTransform.columns.3.x, cameraTransform.columns.3.y, cameraTransform.columns.3.z)
+		let forward = -simd_float3(cameraTransform.columns.2.x, cameraTransform.columns.2.y, cameraTransform.columns.2.z)
+		
+		// Method 1: Try scene reconstruction first (most accurate)
+		let meshAnchors = frame.anchors.compactMap({ $0 as? ARMeshAnchor })
+		if !meshAnchors.isEmpty {
+			for meshAnchor in meshAnchors {
+				let distance = checkMeshDistance(cameraPosition: cameraPosition, forward: forward, meshAnchor: meshAnchor)
+				minDistance = min(minDistance, distance)
+			}
+		}
+		
+		// Method 2: Use depth data if available
+		if minDistance >= maxDetectionDistance, let depthData = frame.sceneDepth {
+			let depthDistance = checkDepthDistance(frame: frame, arView: arView, depthData: depthData)
+			minDistance = min(minDistance, depthDistance)
+		}
+		
+		// Method 3: Raycast fallback
+		if minDistance >= maxDetectionDistance {
+			let raycastDistance = checkRaycastDistance(arView: arView, cameraPosition: cameraPosition, forward: forward)
+			minDistance = min(minDistance, raycastDistance)
+		}
+		
+		return max(minDetectionDistance, minDistance)
+	}
+	
+	private func checkMeshDistance(cameraPosition: simd_float3, forward: simd_float3, meshAnchor: ARMeshAnchor) -> Float {
+		let meshTransform = meshAnchor.transform
+		let geometry = meshAnchor.geometry
+		
+		// Sample points from the mesh and find closest in forward direction
+		var minDistance: Float = maxDetectionDistance
+		
+		// Cast multiple rays in a cone pattern
+		for i in 0..<rayCount {
+			let angle = (Float(i) - Float(rayCount) / 2.0) * raySpread / Float(rayCount)
+			let rayDirection = rotateVectorAroundY(forward, angle: angle)
+			
+			// Simple ray-mesh intersection approximation
+			// Check distance to mesh anchor position as a quick approximation
+			let meshPosition = simd_float3(meshTransform.columns.3.x, meshTransform.columns.3.y, meshTransform.columns.3.z)
+			let toMesh = meshPosition - cameraPosition
+			let distance = simd_length(toMesh)
+			
+			// Only consider if mesh is roughly in forward direction
+			let dot = simd_dot(simd_normalize(toMesh), rayDirection)
+			if dot > 0.5 && distance < maxDetectionDistance {
+				minDistance = min(minDistance, distance)
+			}
+		}
+		
+		return minDistance
+	}
+	
+	private func checkDepthDistance(frame: ARFrame, arView: ARView, depthData: ARDepthData) -> Float {
+		let depthMap = depthData.depthMap
+		CVPixelBufferLockBaseAddress(depthMap, .readOnly)
+		defer { CVPixelBufferUnlockBaseAddress(depthMap, .readOnly) }
+		
+		let width = CVPixelBufferGetWidth(depthMap)
+		let height = CVPixelBufferGetHeight(depthMap)
+		let baseAddress = CVPixelBufferGetBaseAddress(depthMap)?.assumingMemoryBound(to: Float32.self)
+		let bytesPerRow = CVPixelBufferGetBytesPerRow(depthMap)
+		
+		var minDepth: Float = maxDetectionDistance
+		
+		// Sample multiple points in the center region of the depth map
+		let centerRegionSize: Float = 0.3 // 30% of screen around center
+		let widthFloat = Float(width)
+		let heightFloat = Float(height)
+		let startX = Int(widthFloat * (0.5 - centerRegionSize / 2.0))
+		let endX = Int(widthFloat * (0.5 + centerRegionSize / 2.0))
+		let startY = Int(heightFloat * (0.5 - centerRegionSize / 2.0))
+		let endY = Int(heightFloat * (0.5 + centerRegionSize / 2.0))
+		
+		for y in stride(from: startY, to: endY, by: 5) {
+			for x in stride(from: startX, to: endX, by: 5) {
+				if let depth = baseAddress?[y * (bytesPerRow / 4) + x] {
+					if depth > 0 && depth < maxDetectionDistance {
+						minDepth = min(minDepth, depth)
+					}
+				}
+			}
+		}
+		
+		return minDepth
+	}
+	
+	private func checkRaycastDistance(arView: ARView, cameraPosition: simd_float3, forward: simd_float3) -> Float {
+		var minDistance: Float = maxDetectionDistance
+		
+		// Cast rays from screen center and nearby points
+		let screenCenter = CGPoint(x: arView.bounds.midX, y: arView.bounds.midY)
+		let raycastPoints = [
+			screenCenter,
+			CGPoint(x: screenCenter.x - 50, y: screenCenter.y),
+			CGPoint(x: screenCenter.x + 50, y: screenCenter.y),
+			CGPoint(x: screenCenter.x, y: screenCenter.y - 50),
+			CGPoint(x: screenCenter.x, y: screenCenter.y + 50)
+		]
+		
+		for point in raycastPoints {
+			let raycastResults = arView.raycast(from: point, allowing: .estimatedPlane, alignment: .any)
+			if let result = raycastResults.first {
+				let hitPosition = simd_float3(result.worldTransform.columns.3.x, result.worldTransform.columns.3.y, result.worldTransform.columns.3.z)
+				let distance = simd_distance(cameraPosition, hitPosition)
+				minDistance = min(minDistance, distance)
+			}
+		}
+		
+		return minDistance
+	}
+	
+	private func rotateVectorAroundY(_ vector: simd_float3, angle: Float) -> simd_float3 {
+		let cosAngle = cos(angle)
+		let sinAngle = sin(angle)
+		return simd_float3(
+			vector.x * cosAngle + vector.z * sinAngle,
+			vector.y,
+			-vector.x * sinAngle + vector.z * cosAngle
+		)
+	}
+	
+	private func updateHapticFeedback(distance: Float) {
+		let now = CACurrentMediaTime()
+		
+		// Calculate haptic interval based on distance (closer = faster vibrations)
+		let distanceRange = maxDetectionDistance - minDetectionDistance
+		let adjustedDistance = distance - minDetectionDistance
+		let clampedDistance = min(1.0, max(0.0, adjustedDistance / distanceRange))
+		
+		let exponentialDistance = clampedDistance * clampedDistance
+		let intervalRange = maxHapticInterval - minHapticInterval
+		let interval = minHapticInterval + intervalRange * TimeInterval(exponentialDistance)
+		
+		currentHapticInterval = interval
+		
+		// Only trigger haptic if enough time has passed
+		guard now - lastHapticTime >= interval else { return }
+		lastHapticTime = now
+		
+		// Determine feedback intensity based on distance
+		if distance <= veryCloseDistance {
+			// Very close - rigid/heavy feedback
+			isProximityActive = true
+			if distance <= minDetectionDistance * 2 {
+				rigidHaptic.impactOccurred(intensity: 1.0)
+			} else {
+				heavyHaptic.impactOccurred(intensity: 1.0)
+			}
+		} else if distance <= closeDistance {
+			// Close - medium feedback
+			isProximityActive = true
+			let distanceRatio = (distance - veryCloseDistance) / (closeDistance - veryCloseDistance)
+			let intensity = 0.5 + 0.5 * (1.0 - distanceRatio)
+			mediumHaptic.impactOccurred(intensity: CGFloat(intensity))
+		} else if distance <= mediumDistance {
+			// Medium distance - light feedback
+			isProximityActive = true
+			let distanceRatio = (distance - closeDistance) / (mediumDistance - closeDistance)
+			let intensity = 0.3 + 0.4 * (1.0 - distanceRatio)
+			lightHaptic.impactOccurred(intensity: CGFloat(intensity))
+		} else {
+			// Far away - no feedback
+			isProximityActive = false
+		}
+		
+		// Prepare generators for next use
+		if isProximityActive {
+			lightHaptic.prepare()
+			mediumHaptic.prepare()
+			heavyHaptic.prepare()
+			rigidHaptic.prepare()
+		}
+	}
+}
 
 class SpatialAudioManager: ObservableObject {
 	private let audioEngine = AVAudioEngine()
@@ -319,9 +558,13 @@ class SpatialAudioManager: ObservableObject {
 		
 		// Use ARKit's built-in projection method
 		let camera = frame.camera
-		let screenPoint = camera.projectPoint(worldPos, 
-											  orientation: .portrait, 
-											  viewportSize: CGSize(width: viewBounds.width, height: viewBounds.height))
+		// Determine the current interface orientation for accurate projection
+		let interfaceOrientation: UIInterfaceOrientation = (UIApplication.shared.connectedScenes.first as? UIWindowScene)?.interfaceOrientation ?? .portrait
+		let screenPoint = camera.projectPoint(
+			worldPos,
+			orientation: interfaceOrientation,
+			viewportSize: CGSize(width: viewBounds.width, height: viewBounds.height)
+		)
 		
 		// Check if the point is within the screen bounds
 		if screenPoint.x >= 0 && screenPoint.x <= viewBounds.width && 
@@ -441,6 +684,23 @@ class SpatialAudioManager: ObservableObject {
 		}
 	}
 	
+	func clearTarget() {
+		print("🚫 Clearing target")
+		
+		// Stop any pinging
+		stopPinging()
+		
+		// Clear target positions
+		targetWorldPosition = nil
+		targetScreenPosition = nil
+		
+		// Clear detection indicators
+		detectedObjectScreenPosition = nil
+		detectedBoundingBox = nil
+		
+		print("✅ Target cleared")
+	}
+	
 	func stopHeadTracking() {
 		if isHeadTrackingActive {
 			headTracker.stopDeviceMotionUpdates()
@@ -531,6 +791,11 @@ class WaypointManager: ObservableObject {
 	func setActiveWaypoint(_ waypoint: Waypoint) {
 		activeWaypoint = waypoint
 		print("🎯 Set active waypoint: '\(waypoint.name)'")
+	}
+	
+	func clearActiveWaypoint() {
+		activeWaypoint = nil
+		print("🚫 Cleared active waypoint")
 	}
 	
 	func findWaypoint(byName name: String) -> Waypoint? {
@@ -713,29 +978,60 @@ class ObjectDetectionManager: ObservableObject {
 	}
 	
 	private func calculateCenterPoint(from bbox: BoundingBox, imageSize: CGSize) -> (center: CGPoint, boundingBox: CGRect) {
-		// bbox.box_2d format: [y_min, x_min, y_max, x_max] (normalized to 1000)
-		let yMinNorm = CGFloat(bbox.box_2d[0]) / 1000.0
-		let xMinNorm = CGFloat(bbox.box_2d[1]) / 1000.0 
-		let yMaxNorm = CGFloat(bbox.box_2d[2]) / 1000.0
-		let xMaxNorm = CGFloat(bbox.box_2d[3]) / 1000.0
+		// bbox.box_2d format: [y_min, x_min, y_max, x_max]
+		// Robust unit handling: supports pixel, 0-1000, or 0-1 normalized inputs
+		let yMinRaw = CGFloat(bbox.box_2d[0])
+		let xMinRaw = CGFloat(bbox.box_2d[1])
+		let yMaxRaw = CGFloat(bbox.box_2d[2])
+		let xMaxRaw = CGFloat(bbox.box_2d[3])
 		
-		// Calculate center in normalized coordinates (0-1)
-		let centerXNorm = (xMinNorm + xMaxNorm) / 2
-		let centerYNorm = (yMinNorm + yMaxNorm) / 2
+		let maxRaw = max(yMinRaw, xMinRaw, yMaxRaw, xMaxRaw)
 		
-		// Convert to actual image pixel coordinates
-		let centerX = centerXNorm * imageSize.width
-		let centerY = centerYNorm * imageSize.height
+		// Determine scale
+		let xMinPx: CGFloat
+		let yMinPx: CGFloat
+		let xMaxPx: CGFloat
+		let yMaxPx: CGFloat
 		
-		// Create bounding box in image coordinates
+		if maxRaw <= 1.001 {
+			// Already 0-1 normalized
+			xMinPx = xMinRaw * imageSize.width
+			yMinPx = yMinRaw * imageSize.height
+			xMaxPx = xMaxRaw * imageSize.width
+			yMaxPx = yMaxRaw * imageSize.height
+		} else if maxRaw <= 1000.0 {
+			// 0-1000 normalized
+			xMinPx = (xMinRaw / 1000.0) * imageSize.width
+			yMinPx = (yMinRaw / 1000.0) * imageSize.height
+			xMaxPx = (xMaxRaw / 1000.0) * imageSize.width
+			yMaxPx = (yMaxRaw / 1000.0) * imageSize.height
+		} else {
+			// Pixel coordinates
+			xMinPx = xMinRaw
+			yMinPx = yMinRaw
+			xMaxPx = xMaxRaw
+			yMaxPx = yMaxRaw
+		}
+		
+		// Clamp to image bounds
+		let clampedXMin = max(0, min(imageSize.width, xMinPx))
+		let clampedYMin = max(0, min(imageSize.height, yMinPx))
+		let clampedXMax = max(0, min(imageSize.width, xMaxPx))
+		let clampedYMax = max(0, min(imageSize.height, yMaxPx))
+		
+		let centerX = (clampedXMin + clampedXMax) / 2.0
+		let centerY = (clampedYMin + clampedYMax) / 2.0
+		
 		let boundingBox = CGRect(
-			x: xMinNorm * imageSize.width,
-			y: yMinNorm * imageSize.height,
-			width: (xMaxNorm - xMinNorm) * imageSize.width,
-			height: (yMaxNorm - yMinNorm) * imageSize.height
+			x: min(clampedXMin, clampedXMax),
+			y: min(clampedYMin, clampedYMax),
+			width: abs(clampedXMax - clampedXMin),
+			height: abs(clampedYMax - clampedYMin)
 		)
 		
-		print("📍 Normalized center: (\(centerXNorm), \(centerYNorm))")
+		let normCenterX = centerX / imageSize.width
+		let normCenterY = centerY / imageSize.height
+		print("📍 Normalized center: (\(normCenterX), \(normCenterY))")
 		print("📍 Pixel center: (\(centerX), \(centerY)) in image size: \(imageSize)")
 		print("📦 Bounding box: \(boundingBox)")
 		
@@ -873,36 +1169,21 @@ class SpeechManager: ObservableObject {
 }
 
 struct ContentView: View {
-	@State private var serverURLString: String = UserDefaults.standard.string(forKey: "serverURL") ?? "ws://192.168.1.100:8765"
-	@State private var isStreaming: Bool = false
 	@StateObject private var spatialAudioManager = SpatialAudioManager()
 	@StateObject private var objectDetectionManager = ObjectDetectionManager()
 	@StateObject private var speechManager = SpeechManager()
 	@StateObject private var waypointManager = WaypointManager()
+	@StateObject private var proximityManager = ProximityDetectionManager()
 
 	var body: some View {
 		VStack(spacing: 0) {
-			HStack {
-				TextField("ws://host:8765", text: $serverURLString)
-					.textFieldStyle(.roundedBorder)
-					.keyboardType(.URL)
-					.textInputAutocapitalization(.never)
-					.disableAutocorrection(true)
-				Button(isStreaming ? "Stop" : "Start") {
-					isStreaming.toggle()
-					UserDefaults.standard.set(serverURLString, forKey: "serverURL")
-					NotificationCenter.default.post(name: .streamToggle, object: nil, userInfo: ["on": isStreaming, "url": serverURLString])
-				}
-			}
-			.padding(8)
-			.background(Color(.secondarySystemBackground))
-
 			ZStack {
 				ARViewContainer(
 					spatialAudioManager: spatialAudioManager,
 					objectDetectionManager: objectDetectionManager,
 					speechManager: speechManager,
-					waypointManager: waypointManager
+					waypointManager: waypointManager,
+					proximityManager: proximityManager
 				)
 				.ignoresSafeArea()
 				
@@ -1029,7 +1310,7 @@ struct ContentView: View {
 											spatialAudioManager.setTarget(worldPosition: waypoint.worldPosition)
 										} else {
 											// Fall back to object detection
-											NotificationCenter.default.post(name: .detectObject, object: nil, userInfo: ["target": speechManager.recognizedText])
+										NotificationCenter.default.post(name: .detectObject, object: nil, userInfo: ["target": speechManager.recognizedText, "boxOnly": true])
 										}
 									}
 								} else {
@@ -1098,6 +1379,43 @@ struct ContentView: View {
 									.cornerRadius(25)
 							}
 						}
+						
+						// Proximity detection toggle
+						Button(action: {
+							proximityManager.toggle()
+						}) {
+							HStack(spacing: 8) {
+								Image(systemName: proximityManager.isEnabled ? "iphone.radiowaves.left.and.right" : "iphone")
+									.font(.system(size: 16))
+								Text(proximityManager.isEnabled ? "Proximity ON" : "Proximity OFF")
+									.font(.system(size: 16, weight: .medium))
+							}
+							.foregroundColor(.white)
+							.padding(.horizontal, 20)
+							.padding(.vertical, 12)
+							.background(proximityManager.isEnabled ? Color.orange.opacity(0.8) : Color.gray.opacity(0.6))
+							.cornerRadius(25)
+						}
+						
+						// Clear target button (only show when target is active)
+						if spatialAudioManager.isPlayingPing || waypointManager.activeWaypoint != nil {
+							Button(action: {
+								spatialAudioManager.clearTarget()
+								waypointManager.clearActiveWaypoint()
+							}) {
+								HStack(spacing: 8) {
+									Image(systemName: "xmark.circle")
+										.font(.system(size: 16))
+									Text("Clear Target")
+										.font(.system(size: 16, weight: .medium))
+								}
+								.foregroundColor(.white)
+								.padding(.horizontal, 20)
+								.padding(.vertical, 12)
+								.background(Color.red.opacity(0.8))
+								.cornerRadius(25)
+							}
+						}
 					}
 					
 					// Status messages
@@ -1119,6 +1437,34 @@ struct ContentView: View {
 							.background(Color.green.opacity(0.8))
 							.cornerRadius(15)
 							.padding(.top, 10)
+					}
+					
+					// Proximity detection status
+					if proximityManager.isEnabled {
+						VStack(spacing: 5) {
+							HStack(spacing: 8) {
+								Text("📳")
+									.font(.system(size: 12))
+								Text("Proximity Detection")
+									.font(.system(size: 12, weight: .medium))
+								if proximityManager.isProximityActive {
+									Circle()
+										.fill(Color.red)
+										.frame(width: 8, height: 8)
+										.animation(.easeInOut(duration: 0.3), value: proximityManager.isProximityActive)
+								}
+							}
+							.foregroundColor(.white)
+							
+							Text(String(format: "Distance: %.1fm", proximityManager.currentDistance))
+								.font(.system(size: 11))
+								.foregroundColor(.white.opacity(0.8))
+						}
+						.padding(.horizontal, 16)
+						.padding(.vertical, 8)
+						.background(proximityManager.isProximityActive ? Color.red.opacity(0.8) : Color.orange.opacity(0.6))
+						.cornerRadius(15)
+						.padding(.top, 5)
 					}
 					
 					// Speech recognition text
@@ -1245,6 +1591,7 @@ struct ContentView: View {
 					.frame(maxWidth: 300)
 				}
 			}
+			.ignoresSafeArea()
 		}
 	}
 	
@@ -1257,7 +1604,6 @@ struct ContentView: View {
 }
 
 extension Notification.Name {
-	static let streamToggle = Notification.Name("streamToggle")
 	static let setTargetCenter = Notification.Name("setTargetCenter")
 	static let detectObject = Notification.Name("detectObject")
 	static let addWaypoint = Notification.Name("addWaypoint")
@@ -1268,6 +1614,7 @@ struct ARViewContainer: UIViewRepresentable {
 	let objectDetectionManager: ObjectDetectionManager
 	let speechManager: SpeechManager
 	let waypointManager: WaypointManager
+	let proximityManager: ProximityDetectionManager
 	
 	func makeUIView(context: Context) -> ARView {
 		let arView = ARView(frame: .zero)
@@ -1292,12 +1639,9 @@ struct ARViewContainer: UIViewRepresentable {
 		context.coordinator.setSpatialAudioManager(spatialAudioManager)
 		context.coordinator.setObjectDetectionManager(objectDetectionManager)
 		context.coordinator.setWaypointManager(waypointManager)
+		context.coordinator.setProximityManager(proximityManager)
 		context.coordinator.setARView(arView)
 
-		NotificationCenter.default.addObserver(forName: .streamToggle, object: nil, queue: .main) { note in
-			guard let on = note.userInfo?["on"] as? Bool, let url = note.userInfo?["url"] as? String else { return }
-			context.coordinator.setStreaming(on: on, urlString: url)
-		}
 		
 		NotificationCenter.default.addObserver(forName: .setTargetCenter, object: nil, queue: .main) { _ in
 			context.coordinator.setTargetAtCenter(arView: arView)
@@ -1305,7 +1649,8 @@ struct ARViewContainer: UIViewRepresentable {
 		
 		NotificationCenter.default.addObserver(forName: .detectObject, object: nil, queue: .main) { note in
 			guard let target = note.userInfo?["target"] as? String else { return }
-			context.coordinator.detectAndSetTarget(target: target, arView: arView)
+			let boxOnly = note.userInfo?["boxOnly"] as? Bool ?? false
+			context.coordinator.detectAndSetTarget(target: target, arView: arView, boxOnly: boxOnly)
 		}
 		
 		NotificationCenter.default.addObserver(forName: .addWaypoint, object: nil, queue: .main) { _ in
@@ -1320,16 +1665,10 @@ struct ARViewContainer: UIViewRepresentable {
 	func makeCoordinator() -> Coordinator { Coordinator() }
 
 	final class Coordinator: NSObject, ARSessionDelegate {
-		private var webSocketTask: URLSessionWebSocketTask?
-		private let session = URLSession(configuration: .default)
-		private var isStreaming: Bool = false
-		private let sendQueue = DispatchQueue(label: "roommapper.stream.queue", qos: .userInitiated)
-		private var lastSentByAnchor: [UUID: TimeInterval] = [:]
-		private let minSendInterval: TimeInterval = 0.4 // seconds per anchor
-		private let pointDownsample: Int = 3 // take every Nth vertex
 		private var spatialAudioManager: SpatialAudioManager?
 		private var objectDetectionManager: ObjectDetectionManager?
 		private var waypointManager: WaypointManager?
+		private var proximityManager: ProximityDetectionManager?
 		private var arView: ARView?
 
 		func setSpatialAudioManager(_ manager: SpatialAudioManager) {
@@ -1344,6 +1683,10 @@ struct ARViewContainer: UIViewRepresentable {
 			waypointManager = manager
 		}
 		
+		func setProximityManager(_ manager: ProximityDetectionManager) {
+			proximityManager = manager
+		}
+		
 		func setARView(_ view: ARView) {
 			arView = view
 		}
@@ -1354,27 +1697,33 @@ struct ARViewContainer: UIViewRepresentable {
 			// Get the center point of the screen
 			let screenCenter = CGPoint(x: arView.bounds.midX, y: arView.bounds.midY)
 			
-			// Perform hit test from the center of the screen
-			let hitTestResults = arView.hitTest(screenCenter, types: [.existingPlaneUsingExtent, .estimatedHorizontalPlane, .featurePoint])
+			// Prefer raycast for accuracy (supports vertical and horizontal planes)
+			if let raycastResult = arView.raycast(from: screenCenter, allowing: .estimatedPlane, alignment: .any).first {
+				let worldTransform = raycastResult.worldTransform
+				let worldPosition = simd_float3(worldTransform.columns.3.x, worldTransform.columns.3.y, worldTransform.columns.3.z)
+				spatialAudioManager?.setTarget(worldPosition: worldPosition)
+				print("Target set via raycast at world position: \(worldPosition)")
+				return
+			}
+			
+			// Fallback to classic hitTest with broader types (including vertical planes)
+			let hitTestResults = arView.hitTest(
+				screenCenter,
+				types: [.existingPlaneUsingExtent, .existingPlane, .estimatedHorizontalPlane, .estimatedVerticalPlane, .featurePoint]
+			)
 			
 			if let result = hitTestResults.first {
-				// Convert hit test result to world position
 				let worldTransform = result.worldTransform
 				let worldPosition = simd_float3(worldTransform.columns.3.x, worldTransform.columns.3.y, worldTransform.columns.3.z)
-				
-				// Set the target in the spatial audio manager
 				spatialAudioManager?.setTarget(worldPosition: worldPosition)
-				
-				print("Target set at world position: \(worldPosition)")
+				print("Target set via hitTest at world position: \(worldPosition)")
 			} else {
-				// Fallback: set target 1 meter in front of the camera
+				// Final fallback: set target 1 meter in front of the camera
 				let cameraTransform = frame.camera.transform
 				let cameraPosition = simd_float3(cameraTransform.columns.3.x, cameraTransform.columns.3.y, cameraTransform.columns.3.z)
 				let cameraForward = -simd_float3(cameraTransform.columns.2.x, cameraTransform.columns.2.y, cameraTransform.columns.2.z)
 				let targetPosition = cameraPosition + cameraForward * 1.0
-				
 				spatialAudioManager?.setTarget(worldPosition: targetPosition)
-				
 				print("Target set at fallback position: \(targetPosition)")
 			}
 		}
@@ -1410,7 +1759,7 @@ struct ARViewContainer: UIViewRepresentable {
 			}
 		}
 		
-		func detectAndSetTarget(target: String, arView: ARView) {
+		func detectAndSetTarget(target: String, arView: ARView, boxOnly: Bool = false) {
 			guard let frame = arView.session.currentFrame,
 				  let detectionManager = objectDetectionManager else { return }
 			
@@ -1429,128 +1778,67 @@ struct ARViewContainer: UIViewRepresentable {
 				
 				print("🎯 Object detected at image point: \(imagePoint)")
 				
-				// Convert image coordinates to ARView screen coordinates using frame data
-				let screenPoint = self.convertImagePointToScreenPoint(imagePoint, capturedImage: frameData.capturedImage, arView: arView)
+				// Convert image coordinates to ARView screen coordinates using ARKit displayTransform
+				let imageSize = CVImageBufferGetDisplaySize(frameData.capturedImage)
+				let screenPoint = self.convertImagePointToScreenPoint(imagePoint, imageSize: imageSize, arView: arView)
 				print("📱 Converted to screen point: \(screenPoint)")
 				
 				// Convert bounding box to screen coordinates if available
 				var screenBoundingBox: CGRect? = nil
 				if let imageBBox = imageBoundingBox {
-					screenBoundingBox = self.convertImageRectToScreenRect(imageBBox, capturedImage: frameData.capturedImage, arView: arView)
+					screenBoundingBox = self.convertImageRectToScreenRect(imageBBox, imageSize: imageSize, arView: arView)
 				}
 				
-				// Show visual indicators where object was detected
-				self.spatialAudioManager?.setDetectedObjectScreenPosition(screenPoint)
-				self.spatialAudioManager?.setDetectedBoundingBox(screenBoundingBox)
-				
-				// Convert screen point to world position using LiDAR/depth
-				self.setTargetFromScreenPoint(screenPoint, arView: arView, camera: frameData.camera, sceneDepth: frameData.sceneDepth)
+				if boxOnly {
+					// Box-only mode: draw only the bounding box, no center point or spatial target
+					self.spatialAudioManager?.setDetectedBoundingBox(screenBoundingBox)
+					self.spatialAudioManager?.setDetectedObjectScreenPosition(nil)
+					// Also place the waypoint (green target) at the center of the box
+					self.setTargetFromScreenPoint(screenPoint, arView: arView, camera: frameData.camera, sceneDepth: frameData.sceneDepth)
+					print("🟦 Box-only mode: drew bounding box and placed waypoint at center")
+				} else {
+					// Show visual indicators where object was detected
+					self.spatialAudioManager?.setDetectedObjectScreenPosition(screenPoint)
+					self.spatialAudioManager?.setDetectedBoundingBox(screenBoundingBox)
+					
+					// Convert screen point to world position using LiDAR/depth
+					self.setTargetFromScreenPoint(screenPoint, arView: arView, camera: frameData.camera, sceneDepth: frameData.sceneDepth)
+				}
 			}
 		}
 		
-		private func convertImagePointToScreenPoint(_ imagePoint: CGPoint, capturedImage: CVPixelBuffer, arView: ARView) -> CGPoint {
-			// Get the camera image size
-			let imageSize = CVImageBufferGetDisplaySize(capturedImage)
+		private func convertImagePointToScreenPoint(_ imagePoint: CGPoint, imageSize: CGSize, arView: ARView) -> CGPoint {
 			let viewSize = arView.bounds.size
+			guard let frame = arView.session.currentFrame else { return .zero }
+			let interfaceOrientation: UIInterfaceOrientation = (UIApplication.shared.connectedScenes.first as? UIWindowScene)?.interfaceOrientation ?? .portrait
 			
-			// Calculate aspect ratios
-			let imageAspect = imageSize.width / imageSize.height
-			let viewAspect = viewSize.width / viewSize.height
-			
-			var screenPoint: CGPoint
-			
-			if imageAspect > viewAspect {
-				// Image is wider than view - fit height, crop width
-				let scaledHeight = viewSize.height
-				let scaledWidth = scaledHeight * imageAspect
-				let xOffset = (scaledWidth - viewSize.width) / 2
-				
-				let normalizedX = imagePoint.x / imageSize.width
-				let normalizedY = imagePoint.y / imageSize.height
-				
-				screenPoint = CGPoint(
-					x: normalizedX * scaledWidth - xOffset,
-					y: normalizedY * scaledHeight
-				)
-			} else {
-				// Image is taller than view - fit width, crop height
-				let scaledWidth = viewSize.width
-				let scaledHeight = scaledWidth / imageAspect
-				let yOffset = (scaledHeight - viewSize.height) / 2
-				
-				let normalizedX = imagePoint.x / imageSize.width
-				let normalizedY = imagePoint.y / imageSize.height
-				
-				screenPoint = CGPoint(
-					x: normalizedX * scaledWidth,
-					y: normalizedY * scaledHeight - yOffset
-				)
-			}
-			
-			// Clamp to view bounds
-			screenPoint.x = max(0, min(viewSize.width, screenPoint.x))
-			screenPoint.y = max(0, min(viewSize.height, screenPoint.y))
-			
-			print("📐 Image size: \(imageSize), View size: \(viewSize)")
-			print("📐 Image aspect: \(imageAspect), View aspect: \(viewAspect)")
-			print("📐 Final screen point: \(screenPoint)")
-			
-			return screenPoint
+			var normalized = CGPoint(x: imagePoint.x / imageSize.width, y: imagePoint.y / imageSize.height)
+			let transform = frame.displayTransform(for: interfaceOrientation, viewportSize: viewSize)
+			let mapped = normalized.applying(transform)
+			let screenPoint = CGPoint(x: mapped.x * viewSize.width, y: mapped.y * viewSize.height)
+			return CGPoint(x: max(0, min(viewSize.width, screenPoint.x)), y: max(0, min(viewSize.height, screenPoint.y)))
 		}
 		
-		private func convertImageRectToScreenRect(_ imageRect: CGRect, capturedImage: CVPixelBuffer, arView: ARView) -> CGRect {
-			// Get the camera image size
-			let imageSize = CVImageBufferGetDisplaySize(capturedImage)
+		private func convertImageRectToScreenRect(_ imageRect: CGRect, imageSize: CGSize, arView: ARView) -> CGRect {
 			let viewSize = arView.bounds.size
+			guard let frame = arView.session.currentFrame else { return .zero }
+			let interfaceOrientation: UIInterfaceOrientation = (UIApplication.shared.connectedScenes.first as? UIWindowScene)?.interfaceOrientation ?? .portrait
+			let transform = frame.displayTransform(for: interfaceOrientation, viewportSize: viewSize)
 			
-			// Calculate aspect ratios
-			let imageAspect = imageSize.width / imageSize.height
-			let viewAspect = viewSize.width / viewSize.height
+			let topLeft = CGPoint(x: imageRect.minX / imageSize.width, y: imageRect.minY / imageSize.height).applying(transform)
+			let topRight = CGPoint(x: imageRect.maxX / imageSize.width, y: imageRect.minY / imageSize.height).applying(transform)
+			let bottomLeft = CGPoint(x: imageRect.minX / imageSize.width, y: imageRect.maxY / imageSize.height).applying(transform)
+			let bottomRight = CGPoint(x: imageRect.maxX / imageSize.width, y: imageRect.maxY / imageSize.height).applying(transform)
 			
-			var screenRect: CGRect
+			let xs = [topLeft.x, topRight.x, bottomLeft.x, bottomRight.x].map { $0 * viewSize.width }
+			let ys = [topLeft.y, topRight.y, bottomLeft.y, bottomRight.y].map { $0 * viewSize.height }
 			
-			if imageAspect > viewAspect {
-				// Image is wider than view - fit height, crop width
-				let scaledHeight = viewSize.height
-				let scaledWidth = scaledHeight * imageAspect
-				let xOffset = (scaledWidth - viewSize.width) / 2
-				
-				let normalizedX = imageRect.origin.x / imageSize.width
-				let normalizedY = imageRect.origin.y / imageSize.height
-				let normalizedWidth = imageRect.width / imageSize.width
-				let normalizedHeight = imageRect.height / imageSize.height
-				
-				screenRect = CGRect(
-					x: normalizedX * scaledWidth - xOffset,
-					y: normalizedY * scaledHeight,
-					width: normalizedWidth * scaledWidth,
-					height: normalizedHeight * scaledHeight
-				)
-			} else {
-				// Image is taller than view - fit width, crop height
-				let scaledWidth = viewSize.width
-				let scaledHeight = scaledWidth / imageAspect
-				let yOffset = (scaledHeight - viewSize.height) / 2
-				
-				let normalizedX = imageRect.origin.x / imageSize.width
-				let normalizedY = imageRect.origin.y / imageSize.height
-				let normalizedWidth = imageRect.width / imageSize.width
-				let normalizedHeight = imageRect.height / imageSize.height
-				
-				screenRect = CGRect(
-					x: normalizedX * scaledWidth,
-					y: normalizedY * scaledHeight - yOffset,
-					width: normalizedWidth * scaledWidth,
-					height: normalizedHeight * scaledHeight
-				)
-			}
+			let minX = max(0, min(xs.min() ?? 0, viewSize.width))
+			let maxX = min(viewSize.width, max(xs.max() ?? 0, 0))
+			let minY = max(0, min(ys.min() ?? 0, viewSize.height))
+			let maxY = min(viewSize.height, max(ys.max() ?? 0, 0))
 			
-			// Clamp to view bounds
-			let clampedRect = screenRect.intersection(CGRect(origin: .zero, size: viewSize))
-			
-			print("📐 Image rect: \(imageRect), Screen rect: \(clampedRect)")
-			
-			return clampedRect
+			return CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
 		}
 		
 		private func setTargetFromScreenPoint(_ screenPoint: CGPoint, arView: ARView, camera: ARCamera, sceneDepth: ARDepthData?) {
@@ -1685,15 +1973,6 @@ struct ARViewContainer: UIViewRepresentable {
 			print("Object target set at fallback position: \(targetPosition)")
 		}
 
-		func setStreaming(on: Bool, urlString: String) {
-			isStreaming = on
-			webSocketTask?.cancel(with: .goingAway, reason: nil)
-			webSocketTask = nil
-			lastSentByAnchor.removeAll()
-			guard on, let url = URL(string: urlString) else { return }
-			webSocketTask = session.webSocketTask(with: url)
-			webSocketTask?.resume()
-		}
 
 		func session(_ session: ARSession, didUpdate frame: ARFrame) {
 			// Extract data we need immediately to avoid retaining the frame
@@ -1709,106 +1988,17 @@ struct ARViewContainer: UIViewRepresentable {
 					frame: currentFrame,
 					viewBounds: arView.bounds
 				)
+				
+				// Update proximity detection
+				proximityManager?.updateProximity(frame: currentFrame, arView: arView)
 			}
 			
 			// Don't hold onto the frame reference beyond this point
 		}
 
-		func session(_ session: ARSession, didAdd anchors: [ARAnchor]) { handle(anchors: anchors) }
-		func session(_ session: ARSession, didUpdate anchors: [ARAnchor]) { handle(anchors: anchors) }
+		func session(_ session: ARSession, didAdd anchors: [ARAnchor]) { }
+		func session(_ session: ARSession, didUpdate anchors: [ARAnchor]) { }
 
-		private func handle(anchors: [ARAnchor]) {
-			guard isStreaming, let ws = webSocketTask else { return }
-			let now = CACurrentMediaTime()
-			for anchor in anchors {
-				guard let meshAnchor = anchor as? ARMeshAnchor else { continue }
-				let last = lastSentByAnchor[meshAnchor.identifier] ?? 0
-				if now - last < minSendInterval { continue }
-				lastSentByAnchor[meshAnchor.identifier] = now
-				let geometry = meshAnchor.geometry
-				// Extract data immediately to avoid retaining anchor/geometry references
-				let vertices = geometry.vertices.asArray()
-				let anchorId = meshAnchor.identifier.uuidString
-				let transform = meshAnchor.transform
-				
-				sendQueue.async { [weak self] in
-					guard let self = self else { return }
-					var verts = vertices
-					// Downsample points by taking every Nth triplet
-					if self.pointDownsample > 1 && !verts.isEmpty {
-						var reduced: [Float] = []
-						reduced.reserveCapacity(verts.count / self.pointDownsample)
-						for i in stride(from: 0, to: verts.count, by: self.pointDownsample * 3) {
-							guard i + 2 < verts.count else { break }
-							reduced.append(verts[i]); reduced.append(verts[i+1]); reduced.append(verts[i+2])
-						}
-						verts = reduced
-					}
-					let transformArray: [Float] = [
-						transform.columns.0.x, transform.columns.0.y, transform.columns.0.z, transform.columns.0.w,
-						transform.columns.1.x, transform.columns.1.y, transform.columns.1.z, transform.columns.1.w,
-						transform.columns.2.x, transform.columns.2.y, transform.columns.2.z, transform.columns.2.w,
-						transform.columns.3.x, transform.columns.3.y, transform.columns.3.z, transform.columns.3.w
-					]
-					let msg: [String: Any] = [
-						"type": "point-cloud",
-						"anchorId": anchorId,
-						"transform": transformArray,
-						"points": verts
-					]
-					do {
-						let data = try JSONSerialization.data(withJSONObject: msg, options: [])
-						ws.send(.data(data)) { error in
-							if let error = error { print("WebSocket send error: \(error)") }
-						}
-					} catch {
-						print("JSON encode error: \(error)")
-					}
-				}
-			}
-		}
 	}
 }
 
-private extension ARGeometrySource {
-	func asArray() -> [Float] {
-		let stride = self.stride
-		let offset = self.offset
-		let count = self.count
-		var result = [Float]()
-		result.reserveCapacity(count * 3)
-		let buffer = self.buffer.contents()
-		for i in 0..<count {
-			let base = buffer.advanced(by: offset + i * stride)
-			let f = base.bindMemory(to: Float.self, capacity: 3)
-			result.append(f[0]); result.append(f[1]); result.append(f[2])
-		}
-		return result
-	}
-}
-
-private extension ARGeometryElement {
-	// No longer used; kept for reference if mesh streaming is restored
-	func asArrayUInt32() -> [UInt32] {
-		let primitives = self.count
-		let indicesPerPrim = self.indexCountPerPrimitive
-		var out = [UInt32]()
-		out.reserveCapacity(primitives * indicesPerPrim)
-		let buffer = self.buffer.contents()
-		let startOffset = 0
-		if self.bytesPerIndex == 2 {
-			for i in 0..<(primitives * indicesPerPrim) {
-				let base = buffer.advanced(by: startOffset + i * 2)
-				let v = UInt32(base.bindMemory(to: UInt16.self, capacity: 1).pointee)
-				out.append(v)
-			}
-		} else {
-			for i in 0..<(primitives * indicesPerPrim) {
-				let base = buffer.advanced(by: startOffset + i * 4)
-				let v = base.bindMemory(to: UInt32.self, capacity: 1).pointee
-				out.append(v)
-			}
-		}
-		return out
-	}
-}
