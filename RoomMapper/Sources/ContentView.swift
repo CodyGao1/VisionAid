@@ -19,6 +19,7 @@ class SpatialAudioManager: ObservableObject {
 	@Published var targetScreenPosition: CGPoint?
 	@Published var isPlayingPing = false
 	@Published var detectedObjectScreenPosition: CGPoint?
+	@Published var detectedBoundingBox: CGRect?
 	
 	private var currentCameraPosition: simd_float3 = simd_float3(0, 0, 0)
 	private let maxPingInterval: TimeInterval = 1.2 // seconds when far away
@@ -185,6 +186,23 @@ class SpatialAudioManager: ObservableObject {
 				DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
 					print("🔵 Clearing detected object indicator")
 					self?.detectedObjectScreenPosition = nil
+				}
+			}
+		}
+	}
+	
+	func setDetectedBoundingBox(_ boundingBox: CGRect?) {
+		print("📦 Setting detected bounding box: \(boundingBox?.debugDescription ?? "nil")")
+		
+		// Ensure UI updates happen on main thread
+		DispatchQueue.main.async { [weak self] in
+			self?.detectedBoundingBox = boundingBox
+			
+			// Clear the bounding box after 4 seconds (slightly longer than center point)
+			if boundingBox != nil {
+				DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) { [weak self] in
+					print("📦 Clearing detected bounding box")
+					self?.detectedBoundingBox = nil
 				}
 			}
 		}
@@ -466,7 +484,7 @@ class ObjectDetectionManager: ObservableObject {
 		detectEndpoint = "\(vmServerURL)/detect"
 	}
 	
-	func detectObject(in frame: ARFrame, target: String, completion: @escaping (CGPoint?) -> Void) {
+	func detectObject(in frame: ARFrame, target: String, completion: @escaping (CGPoint?, CGRect?) -> Void) {
 		isDetecting = true
 		lastDetectionResult = "Detecting \(target)..."
 		
@@ -476,7 +494,7 @@ class ObjectDetectionManager: ObservableObject {
 			DispatchQueue.main.async {
 				self.isDetecting = false
 				self.lastDetectionResult = "Failed to capture image"
-				completion(nil)
+				completion(nil, nil)
 			}
 			return
 		}
@@ -486,7 +504,7 @@ class ObjectDetectionManager: ObservableObject {
 			DispatchQueue.main.async {
 				self.isDetecting = false
 				self.lastDetectionResult = "Failed to encode image"
-				completion(nil)
+				completion(nil, nil)
 			}
 			return
 		}
@@ -500,7 +518,7 @@ class ObjectDetectionManager: ObservableObject {
 			DispatchQueue.main.async {
 				self.isDetecting = false
 				self.lastDetectionResult = "Invalid server URL"
-				completion(nil)
+				completion(nil, nil)
 			}
 			return
 		}
@@ -516,7 +534,7 @@ class ObjectDetectionManager: ObservableObject {
 			DispatchQueue.main.async {
 				self.isDetecting = false
 				self.lastDetectionResult = "Failed to encode request"
-				completion(nil)
+				completion(nil, nil)
 			}
 			return
 		}
@@ -527,13 +545,13 @@ class ObjectDetectionManager: ObservableObject {
 				
 				if let error = error {
 					self?.lastDetectionResult = "Network error: \(error.localizedDescription)"
-					completion(nil)
+					completion(nil, nil)
 					return
 				}
 				
 				guard let data = data else {
 					self?.lastDetectionResult = "No data received"
-					completion(nil)
+					completion(nil, nil)
 					return
 				}
 				
@@ -543,16 +561,16 @@ class ObjectDetectionManager: ObservableObject {
 					if detectionResponse.success, let firstDetection = detectionResponse.detections.first {
 						self?.lastDetectionResult = "Found \(firstDetection.label)"
 						
-						// Calculate center point of bounding box
-						let centerPoint = self?.calculateCenterPoint(from: firstDetection, imageSize: image.size)
-						completion(centerPoint)
+						// Calculate center point and bounding box
+						let result = self?.calculateCenterPoint(from: firstDetection, imageSize: image.size)
+						completion(result?.center, result?.boundingBox)
 					} else {
 						self?.lastDetectionResult = "No \(target) found"
-						completion(nil)
+						completion(nil, nil)
 					}
 				} catch {
 					self?.lastDetectionResult = "Failed to parse response"
-					completion(nil)
+					completion(nil, nil)
 				}
 			}
 		}.resume()
@@ -569,7 +587,7 @@ class ObjectDetectionManager: ObservableObject {
 		return UIImage(cgImage: cgImage)
 	}
 	
-	private func calculateCenterPoint(from bbox: BoundingBox, imageSize: CGSize) -> CGPoint {
+	private func calculateCenterPoint(from bbox: BoundingBox, imageSize: CGSize) -> (center: CGPoint, boundingBox: CGRect) {
 		// bbox.box_2d format: [y_min, x_min, y_max, x_max] (normalized to 1000)
 		let yMinNorm = CGFloat(bbox.box_2d[0]) / 1000.0
 		let xMinNorm = CGFloat(bbox.box_2d[1]) / 1000.0 
@@ -584,10 +602,19 @@ class ObjectDetectionManager: ObservableObject {
 		let centerX = centerXNorm * imageSize.width
 		let centerY = centerYNorm * imageSize.height
 		
+		// Create bounding box in image coordinates
+		let boundingBox = CGRect(
+			x: xMinNorm * imageSize.width,
+			y: yMinNorm * imageSize.height,
+			width: (xMaxNorm - xMinNorm) * imageSize.width,
+			height: (yMaxNorm - yMinNorm) * imageSize.height
+		)
+		
 		print("📍 Normalized center: (\(centerXNorm), \(centerYNorm))")
 		print("📍 Pixel center: (\(centerX), \(centerY)) in image size: \(imageSize)")
+		print("📦 Bounding box: \(boundingBox)")
 		
-		return CGPoint(x: centerX, y: centerY)
+		return (center: CGPoint(x: centerX, y: centerY), boundingBox: boundingBox)
 	}
 }
 
@@ -813,7 +840,26 @@ struct ContentView: View {
 					.animation(.easeInOut(duration: 0.3), value: targetPos)
 				}
 				
-				// Detected object indicator (blue circle with eye icon)
+				// Detected object bounding box (blue rectangle showing Gemini's detection)
+				if let boundingBox = spatialAudioManager.detectedBoundingBox {
+					Rectangle()
+						.stroke(Color.blue, lineWidth: 2)
+						.frame(width: boundingBox.width, height: boundingBox.height)
+						.position(x: boundingBox.midX, y: boundingBox.midY)
+						.animation(.easeInOut(duration: 0.3), value: boundingBox)
+						.opacity(0.8)
+					
+					// Label for the bounding box
+					Text("GEMINI DETECTION")
+						.font(.system(size: 12, weight: .bold))
+						.foregroundColor(.blue)
+						.background(Color.white.opacity(0.8))
+						.cornerRadius(4)
+						.position(x: boundingBox.midX, y: boundingBox.minY - 10)
+						.animation(.easeInOut(duration: 0.3), value: boundingBox)
+				}
+				
+				// Detected object center point indicator (blue circle with eye icon)
 				if let detectedPos = spatialAudioManager.detectedObjectScreenPosition {
 					ZStack {
 						Circle()
@@ -828,7 +874,7 @@ struct ContentView: View {
 							.font(.system(size: 16, weight: .bold))
 							.foregroundColor(.white)
 						
-						Text("DETECTED")
+						Text("CENTER")
 							.font(.system(size: 10, weight: .bold))
 							.foregroundColor(.blue)
 							.offset(x: 0, y: -25)
@@ -1044,7 +1090,7 @@ struct ARViewContainer: UIViewRepresentable {
 				sceneDepth: frame.sceneDepth
 			)
 			
-			detectionManager.detectObject(in: frame, target: target) { [weak self] imagePoint in
+			detectionManager.detectObject(in: frame, target: target) { [weak self] imagePoint, imageBoundingBox in
 				guard let self = self, let imagePoint = imagePoint else { 
 					print("❌ No detection result or imagePoint")
 					return 
@@ -1056,8 +1102,15 @@ struct ARViewContainer: UIViewRepresentable {
 				let screenPoint = self.convertImagePointToScreenPoint(imagePoint, capturedImage: frameData.capturedImage, arView: arView)
 				print("📱 Converted to screen point: \(screenPoint)")
 				
-				// Show visual indicator where object was detected
+				// Convert bounding box to screen coordinates if available
+				var screenBoundingBox: CGRect? = nil
+				if let imageBBox = imageBoundingBox {
+					screenBoundingBox = self.convertImageRectToScreenRect(imageBBox, capturedImage: frameData.capturedImage, arView: arView)
+				}
+				
+				// Show visual indicators where object was detected
 				self.spatialAudioManager?.setDetectedObjectScreenPosition(screenPoint)
+				self.spatialAudioManager?.setDetectedBoundingBox(screenBoundingBox)
 				
 				// Convert screen point to world position using LiDAR/depth
 				self.setTargetFromScreenPoint(screenPoint, arView: arView, camera: frameData.camera, sceneDepth: frameData.sceneDepth)
@@ -1112,6 +1165,61 @@ struct ARViewContainer: UIViewRepresentable {
 			print("📐 Final screen point: \(screenPoint)")
 			
 			return screenPoint
+		}
+		
+		private func convertImageRectToScreenRect(_ imageRect: CGRect, capturedImage: CVPixelBuffer, arView: ARView) -> CGRect {
+			// Get the camera image size
+			let imageSize = CVImageBufferGetDisplaySize(capturedImage)
+			let viewSize = arView.bounds.size
+			
+			// Calculate aspect ratios
+			let imageAspect = imageSize.width / imageSize.height
+			let viewAspect = viewSize.width / viewSize.height
+			
+			var screenRect: CGRect
+			
+			if imageAspect > viewAspect {
+				// Image is wider than view - fit height, crop width
+				let scaledHeight = viewSize.height
+				let scaledWidth = scaledHeight * imageAspect
+				let xOffset = (scaledWidth - viewSize.width) / 2
+				
+				let normalizedX = imageRect.origin.x / imageSize.width
+				let normalizedY = imageRect.origin.y / imageSize.height
+				let normalizedWidth = imageRect.width / imageSize.width
+				let normalizedHeight = imageRect.height / imageSize.height
+				
+				screenRect = CGRect(
+					x: normalizedX * scaledWidth - xOffset,
+					y: normalizedY * scaledHeight,
+					width: normalizedWidth * scaledWidth,
+					height: normalizedHeight * scaledHeight
+				)
+			} else {
+				// Image is taller than view - fit width, crop height
+				let scaledWidth = viewSize.width
+				let scaledHeight = scaledWidth / imageAspect
+				let yOffset = (scaledHeight - viewSize.height) / 2
+				
+				let normalizedX = imageRect.origin.x / imageSize.width
+				let normalizedY = imageRect.origin.y / imageSize.height
+				let normalizedWidth = imageRect.width / imageSize.width
+				let normalizedHeight = imageRect.height / imageSize.height
+				
+				screenRect = CGRect(
+					x: normalizedX * scaledWidth,
+					y: normalizedY * scaledHeight - yOffset,
+					width: normalizedWidth * scaledWidth,
+					height: normalizedHeight * scaledHeight
+				)
+			}
+			
+			// Clamp to view bounds
+			let clampedRect = screenRect.intersection(CGRect(origin: .zero, size: viewSize))
+			
+			print("📐 Image rect: \(imageRect), Screen rect: \(clampedRect)")
+			
+			return clampedRect
 		}
 		
 		private func setTargetFromScreenPoint(_ screenPoint: CGPoint, arView: ARView, camera: ARCamera, sceneDepth: ARDepthData?) {
