@@ -18,19 +18,28 @@ class ProximityDetectionManager: ObservableObject {
 	@Published var isEnabled = false
 	@Published var currentDistance: Float = 10.0
 	@Published var isProximityActive = false
+	@Published var lastResetTime: TimeInterval = 0
 	
-	// Detection parameters
-	private let maxDetectionDistance: Float = 3.0 // meters
-	private let minDetectionDistance: Float = 0.2 // meters
-	private let veryCloseDistance: Float = 0.5 // meters - trigger heavy feedback
-	private let closeDistance: Float = 1.0 // meters - trigger medium feedback
-	private let mediumDistance: Float = 2.0 // meters - trigger light feedback
+	// Detection parameters - expanded range with more granular levels
+	private let maxDetectionDistance: Float = 5.0 // meters - extended range
+	private let minDetectionDistance: Float = 0.15 // meters
 	
-	// Timing control
+	// Distance thresholds for color-coded feedback levels
+	private let veryCloseDistance: Float = 0.4 // meters - DARK RED (shake a lot)
+	private let closeDistance: Float = 0.8 // meters - RED (shake)
+	private let kindOfCloseDistance: Float = 1.5 // meters - ORANGE (decent bit)
+	private let mediumDistance: Float = 2.5 // meters - GREEN (a little)
+	private let farDistance: Float = 4.0 // meters - BLUE (very little)
+	
+	// Timing control - more aggressive when close
 	private var lastHapticTime: TimeInterval = 0
 	private var currentHapticInterval: TimeInterval = 1.0
-	private let maxHapticInterval: TimeInterval = 1.2 // slow when far
-	private let minHapticInterval: TimeInterval = 0.1 // very fast when close
+	private let maxHapticInterval: TimeInterval = 2.0 // very slow when far
+	private let minHapticInterval: TimeInterval = 0.05 // extremely fast when very close
+	
+	// System health monitoring  
+	private let resetInterval: TimeInterval = 30.0 // Reset haptic generators every 30 seconds
+	private var hapticFailureCount = 0
 	
 	// Ray sampling for detection
 	private let rayCount = 5 // Number of rays to cast in front
@@ -49,8 +58,43 @@ class ProximityDetectionManager: ObservableObject {
 		if !isEnabled {
 			isProximityActive = false
 			currentDistance = maxDetectionDistance
+			resetHapticSystem() // Clean reset when disabling
+		} else {
+			// Fresh start when enabling
+			resetHapticSystem()
+			lastHapticTime = 0
+			hapticFailureCount = 0
+			print("📳 Proximity detection enabled with fresh haptic system")
 		}
 		print("📳 Proximity detection \(isEnabled ? "enabled" : "disabled")")
+	}
+	
+	private func resetHapticSystem() {
+		// Recreate haptic generators to prevent stuck states
+		lightHaptic.prepare()
+		mediumHaptic.prepare()
+		heavyHaptic.prepare()
+		rigidHaptic.prepare()
+		
+		DispatchQueue.main.async { [weak self] in
+			self?.lastResetTime = CACurrentMediaTime()
+		}
+		print("🔄 Haptic system reset at \(CACurrentMediaTime())")
+	}
+	
+	func forceReset() {
+		print("🔧 Force reset proximity detection system")
+		resetHapticSystem()
+		lastHapticTime = 0
+		hapticFailureCount = 0
+		isProximityActive = false
+		currentDistance = maxDetectionDistance
+		
+		// Trigger a brief confirmation haptic
+		DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+			self?.lightHaptic.impactOccurred(intensity: 0.5)
+			print("✅ Proximity system reset complete")
+		}
 	}
 	
 	func updateProximity(frame: ARFrame, arView: ARView) {
@@ -195,53 +239,112 @@ class ProximityDetectionManager: ObservableObject {
 	private func updateHapticFeedback(distance: Float) {
 		let now = CACurrentMediaTime()
 		
-		// Calculate haptic interval based on distance (closer = faster vibrations)
-		let distanceRange = maxDetectionDistance - minDetectionDistance
-		let adjustedDistance = distance - minDetectionDistance
-		let clampedDistance = min(1.0, max(0.0, adjustedDistance / distanceRange))
+		// Periodic reset to prevent stuck states
+		if now - lastResetTime > resetInterval {
+			print("⏰ Periodic haptic system reset triggered")
+			resetHapticSystem()
+			hapticFailureCount = 0
+		}
 		
-		let exponentialDistance = clampedDistance * clampedDistance
-		let intervalRange = maxHapticInterval - minHapticInterval
-		let interval = minHapticInterval + intervalRange * TimeInterval(exponentialDistance)
+		// Validate distance is reasonable
+		guard distance > 0 && distance < 100 else {
+			print("⚠️ Invalid distance detected: \(distance)m, skipping haptic")
+			return
+		}
+		
+		// Calculate haptic interval based on distance with exponential curve for more aggressive close feedback
+		let normalizedDistance = min(1.0, max(0.0, distance / maxDetectionDistance))
+		let exponentialCurve = pow(normalizedDistance, 3.0) // Cubic curve for very aggressive close feedback
+		let interval = minHapticInterval + (maxHapticInterval - minHapticInterval) * TimeInterval(exponentialCurve)
 		
 		currentHapticInterval = interval
 		
 		// Only trigger haptic if enough time has passed
 		guard now - lastHapticTime >= interval else { return }
-		lastHapticTime = now
 		
-		// Determine feedback intensity based on distance
-		if distance <= veryCloseDistance {
-			// Very close - rigid/heavy feedback
-			isProximityActive = true
-			if distance <= minDetectionDistance * 2 {
-				rigidHaptic.impactOccurred(intensity: 1.0)
-			} else {
-				heavyHaptic.impactOccurred(intensity: 1.0)
-			}
-		} else if distance <= closeDistance {
-			// Close - medium feedback
-			isProximityActive = true
-			let distanceRatio = (distance - veryCloseDistance) / (closeDistance - veryCloseDistance)
-			let intensity = 0.5 + 0.5 * (1.0 - distanceRatio)
-			mediumHaptic.impactOccurred(intensity: CGFloat(intensity))
-		} else if distance <= mediumDistance {
-			// Medium distance - light feedback
-			isProximityActive = true
-			let distanceRatio = (distance - closeDistance) / (mediumDistance - closeDistance)
-			let intensity = 0.3 + 0.4 * (1.0 - distanceRatio)
-			lightHaptic.impactOccurred(intensity: CGFloat(intensity))
-		} else {
-			// Far away - no feedback
-			isProximityActive = false
+		// Prevent haptic timing from getting stuck
+		if now - lastHapticTime > 5.0 {
+			print("🔄 Resetting stuck haptic timing")
+			lastHapticTime = now - interval
 		}
 		
-		// Prepare generators for next use
-		if isProximityActive {
-			lightHaptic.prepare()
-			mediumHaptic.prepare()
-			heavyHaptic.prepare()
-			rigidHaptic.prepare()
+		lastHapticTime = now
+		
+		// Try to trigger haptic feedback with error handling
+		let hapticTriggered = triggerHapticForDistance(distance)
+		
+		if hapticTriggered {
+			hapticFailureCount = 0
+			print("📳 Haptic triggered for distance: \(String(format: "%.2f", distance))m")
+		} else {
+			hapticFailureCount += 1
+			print("❌ Haptic failed for distance: \(String(format: "%.2f", distance))m, failure count: \(hapticFailureCount)")
+			
+			// Reset system if too many failures
+			if hapticFailureCount >= 3 {
+				print("🔄 Too many haptic failures, resetting system")
+				resetHapticSystem()
+				hapticFailureCount = 0
+			}
+		}
+	}
+	
+	private func triggerHapticForDistance(_ distance: Float) -> Bool {
+		do {
+			// 5-level color-coded feedback system
+			if distance <= veryCloseDistance {
+				// DARK RED - shake a lot (very close)
+				isProximityActive = true
+				if distance <= minDetectionDistance * 1.5 {
+					// Extremely close - maximum intensity rigid feedback
+					rigidHaptic.impactOccurred(intensity: 1.0)
+				} else {
+					// Very close - heavy feedback with high intensity
+					heavyHaptic.impactOccurred(intensity: 1.0)
+				}
+			} else if distance <= closeDistance {
+				// RED - shake (close)
+				isProximityActive = true
+				let distanceRatio = (distance - veryCloseDistance) / (closeDistance - veryCloseDistance)
+				let intensity = 0.7 + 0.3 * (1.0 - distanceRatio) // 0.7 to 1.0 intensity
+				heavyHaptic.impactOccurred(intensity: CGFloat(intensity))
+			} else if distance <= kindOfCloseDistance {
+				// ORANGE - decent bit of shaking (kind of close)
+				isProximityActive = true
+				let distanceRatio = (distance - closeDistance) / (kindOfCloseDistance - closeDistance)
+				let intensity = 0.4 + 0.3 * (1.0 - distanceRatio) // 0.4 to 0.7 intensity
+				mediumHaptic.impactOccurred(intensity: CGFloat(intensity))
+			} else if distance <= mediumDistance {
+				// GREEN - a little shaking (medium distance)
+				isProximityActive = true
+				let distanceRatio = (distance - kindOfCloseDistance) / (mediumDistance - kindOfCloseDistance)
+				let intensity = 0.2 + 0.2 * (1.0 - distanceRatio) // 0.2 to 0.4 intensity
+				lightHaptic.impactOccurred(intensity: CGFloat(intensity))
+			} else if distance <= farDistance {
+				// BLUE - very little shaking (far but detectable)
+				isProximityActive = true
+				let distanceRatio = (distance - mediumDistance) / (farDistance - mediumDistance)
+				let intensity = 0.1 + 0.1 * (1.0 - distanceRatio) // 0.1 to 0.2 intensity
+				lightHaptic.impactOccurred(intensity: CGFloat(intensity))
+			} else {
+				// Beyond detection range - no feedback
+				isProximityActive = false
+			}
+			
+			// Always prepare generators for next use when active
+			if isProximityActive {
+				DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+					self?.lightHaptic.prepare()
+					self?.mediumHaptic.prepare() 
+					self?.heavyHaptic.prepare()
+					self?.rigidHaptic.prepare()
+				}
+			}
+			
+			return true
+		} catch {
+			print("❌ Haptic error: \(error)")
+			return false
 		}
 	}
 }
@@ -1380,21 +1483,38 @@ struct ContentView: View {
 							}
 						}
 						
-						// Proximity detection toggle
-						Button(action: {
-							proximityManager.toggle()
-						}) {
-							HStack(spacing: 8) {
-								Image(systemName: proximityManager.isEnabled ? "iphone.radiowaves.left.and.right" : "iphone")
-									.font(.system(size: 16))
-								Text(proximityManager.isEnabled ? "Proximity ON" : "Proximity OFF")
-									.font(.system(size: 16, weight: .medium))
+						HStack(spacing: 10) {
+							// Proximity detection toggle
+							Button(action: {
+								proximityManager.toggle()
+							}) {
+								HStack(spacing: 8) {
+									Image(systemName: proximityManager.isEnabled ? "iphone.radiowaves.left.and.right" : "iphone")
+										.font(.system(size: 16))
+									Text(proximityManager.isEnabled ? "Proximity ON" : "Proximity OFF")
+										.font(.system(size: 16, weight: .medium))
+								}
+								.foregroundColor(.white)
+								.padding(.horizontal, 20)
+								.padding(.vertical, 12)
+								.background(proximityManager.isEnabled ? Color.orange.opacity(0.8) : Color.gray.opacity(0.6))
+								.cornerRadius(25)
 							}
-							.foregroundColor(.white)
-							.padding(.horizontal, 20)
-							.padding(.vertical, 12)
-							.background(proximityManager.isEnabled ? Color.orange.opacity(0.8) : Color.gray.opacity(0.6))
-							.cornerRadius(25)
+							
+							// Reset proximity button (only show when enabled)
+							if proximityManager.isEnabled {
+								Button(action: {
+									proximityManager.forceReset()
+								}) {
+									Image(systemName: "arrow.clockwise.circle")
+										.font(.system(size: 16))
+										.foregroundColor(.white)
+										.padding(.horizontal, 12)
+										.padding(.vertical, 12)
+										.background(Color.blue.opacity(0.8))
+										.cornerRadius(25)
+								}
+							}
 						}
 						
 						// Clear target button (only show when target is active)
@@ -1439,30 +1559,45 @@ struct ContentView: View {
 							.padding(.top, 10)
 					}
 					
-					// Proximity detection status
+					// Proximity detection status with color-coded feedback
 					if proximityManager.isEnabled {
+						let (statusColor, statusText, backgroundColor) = getProximityColors(distance: proximityManager.currentDistance, isActive: proximityManager.isProximityActive)
+						let (healthSymbol, healthColor) = getProximityHealthStatus()
+						
 						VStack(spacing: 5) {
 							HStack(spacing: 8) {
 								Text("📳")
 									.font(.system(size: 12))
 								Text("Proximity Detection")
 									.font(.system(size: 12, weight: .medium))
+								
+								// Health status indicator
+								Text(healthSymbol)
+									.font(.system(size: 8))
+									.foregroundColor(healthColor)
+								
 								if proximityManager.isProximityActive {
 									Circle()
-										.fill(Color.red)
-										.frame(width: 8, height: 8)
-										.animation(.easeInOut(duration: 0.3), value: proximityManager.isProximityActive)
+										.fill(statusColor)
+										.frame(width: 10, height: 10)
+										.scaleEffect(proximityManager.currentDistance <= 0.8 ? 1.2 : 1.0)
+										.animation(.easeInOut(duration: proximityManager.currentDistance <= 0.4 ? 0.15 : 0.3).repeatForever(autoreverses: true), value: proximityManager.isProximityActive)
 								}
 							}
 							.foregroundColor(.white)
 							
-							Text(String(format: "Distance: %.1fm", proximityManager.currentDistance))
-								.font(.system(size: 11))
-								.foregroundColor(.white.opacity(0.8))
+							HStack(spacing: 8) {
+								Text(String(format: "%.1fm", proximityManager.currentDistance))
+									.font(.system(size: 11, weight: .bold))
+								Text(statusText)
+									.font(.system(size: 10))
+									.opacity(0.9)
+							}
+							.foregroundColor(.white)
 						}
 						.padding(.horizontal, 16)
 						.padding(.vertical, 8)
-						.background(proximityManager.isProximityActive ? Color.red.opacity(0.8) : Color.orange.opacity(0.6))
+						.background(backgroundColor)
 						.cornerRadius(15)
 						.padding(.top, 5)
 					}
@@ -1600,6 +1735,44 @@ struct ContentView: View {
 		formatter.dateStyle = .none
 		formatter.timeStyle = .short
 		return formatter
+	}
+	
+	// Helper function for color-coded proximity feedback
+	private func getProximityColors(distance: Float, isActive: Bool) -> (Color, String, Color) {
+		guard isActive else {
+			return (Color.gray, "No obstacles detected", Color.gray.opacity(0.6))
+		}
+		
+		if distance <= 0.4 { // veryCloseDistance - DARK RED
+			return (Color.red.opacity(0.9), "VERY CLOSE - DANGER!", Color.red.opacity(0.9))
+		} else if distance <= 0.8 { // closeDistance - RED
+			return (Color.red, "CLOSE - CAUTION", Color.red.opacity(0.8))
+		} else if distance <= 1.5 { // kindOfCloseDistance - ORANGE
+			return (Color.orange, "KIND OF CLOSE", Color.orange.opacity(0.8))
+		} else if distance <= 2.5 { // mediumDistance - GREEN
+			return (Color.green, "MEDIUM DISTANCE", Color.green.opacity(0.8))
+		} else if distance <= 4.0 { // farDistance - BLUE
+			return (Color.blue, "FAR BUT DETECTED", Color.blue.opacity(0.8))
+		} else {
+			return (Color.gray, "CLEAR PATH", Color.gray.opacity(0.6))
+		}
+	}
+	
+	private func getProximityHealthStatus() -> (String, Color) {
+		if proximityManager.isEnabled {
+			let now = CACurrentMediaTime()
+			let timeSinceLastReset = now - (proximityManager.lastResetTime > 0 ? proximityManager.lastResetTime : now)
+			
+			if timeSinceLastReset < 5.0 {
+				return ("●", Color.green) // Recently reset - healthy
+			} else if timeSinceLastReset < 25.0 {
+				return ("●", Color.yellow) // Normal operation
+			} else {
+				return ("●", Color.orange) // May need reset soon
+			}
+		} else {
+			return ("○", Color.gray) // Disabled
+		}
 	}
 }
 
